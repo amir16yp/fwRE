@@ -33,6 +33,8 @@ def to_json(rep: RootfsReport, image: str = "") -> str:
         "busybox": rep.busybox.__dict__ if rep.busybox else None,
         "boot": rep.boot,
         "key_fingerprints": rep.key_fps,
+        "interesting_binaries": [b.to_dict() for b in rep.interesting],
+        "network_apis": [n.to_dict() for n in rep.netcalls],
     }
     return json.dumps(obj, indent=2)
 
@@ -100,6 +102,20 @@ def to_markdown(rep: RootfsReport, image: str = "") -> str:
         ap("\n**CVE heuristics** (confirm before trusting):\n")
         for h in rep.cves:
             ap(f"- `{h.severity}` **{h.component} {h.version}** → {h.cve}: {h.note}")
+
+    # interesting / unusual binaries - what to open first in a disassembler
+    interesting = [b for b in rep.interesting if b.score >= 3]
+    if interesting:
+        ap("\n## Interesting / unusual binaries\n")
+        ap("_Ranked by how much each stands out from the rest of the image "
+           "(vendor code, odd location, packing, outliers). Leads for manual "
+           "RE, not vulnerabilities._\n")
+        ap("| score | binary | arch | size | why |")
+        ap("|---|---|---|---|---|")
+        for b in interesting[:25]:
+            kb = f"{b.size // 1024} KB" if b.size else "?"
+            ap(f"| {b.score} | `{b.path}` | {b.machine} | {kb} | "
+               f"{'; '.join(b.reasons)} |")
 
     # ELF audit table (compact)
     if rep.elf_audits:
@@ -171,18 +187,43 @@ def to_markdown(rep: RootfsReport, image: str = "") -> str:
                f"{len(a.world_writable)}  |  writable init scripts: "
                f"{len(a.writable_init)}")
 
-    # IOCs
+    # network API usage per binary (socket/TLS/HTTP calls + where they sit)
+    if rep.netcalls:
+        ap("\n## Network API usage\n")
+        ap("| binary | listens | surface | evidence | sites |")
+        ap("|---|---|---|---|---|")
+        for n in rep.netcalls[:40]:
+            shown = list(n.apis)[:6]
+            sites = "; ".join(
+                f"`{n.apis[a][0].where()}`" + f" ({a}())" for a in shown)
+            ap(f"| `{n.path}` | {'yes' if n.listens else 'no'} | "
+               f"{n.summary()} | {n.evidence} | {sites} |")
+
+    # IOCs - each value is listed with the exact sites it was seen at
+    # (file:line for text, file@vaddr/file+offset for binaries)
     if rep.iocs:
+        locs = rep.iocs.get("locations", {})
+
+        def sites(kind: str, value: str) -> str:
+            got = locs.get(kind, {}).get(value) or []
+            return ", ".join(f"`{s['where']}`" for s in got)
+
         ap("\n## Network IOCs\n")
         if rep.iocs.get("urls"):
             ap("**URLs:**")
             for u in rep.iocs["urls"][:60]:
-                ap(f"- {u}")
+                at = sites("url", u)
+                ap(f"- {u}" + (f" — {at}" if at else ""))
         if rep.iocs.get("cloud_domains"):
-            ap("\n**Cloud/service domains:** " +
-               ", ".join(rep.iocs["cloud_domains"][:40]))
+            ap("\n**Cloud/service domains:**")
+            for d in rep.iocs["cloud_domains"][:40]:
+                at = sites("domain", d)
+                ap(f"- {d}" + (f" — {at}" if at else ""))
         if rep.iocs.get("ips"):
-            ap("\n**IPs:** " + ", ".join(rep.iocs["ips"][:40]))
+            ap("\n**IPs:**")
+            for ip in rep.iocs["ips"][:40]:
+                at = sites("ip", ip)
+                ap(f"- {ip}" + (f" — {at}" if at else ""))
 
     return "\n".join(L) + "\n"
 

@@ -461,32 +461,101 @@ _RCE_SINKS = [
     (re.compile(r'\bsystem\s*\('), "system()"),
     (re.compile(r'\bpopen\s*\('), "popen()"),
     (re.compile(r'\bexec[lv][ep]?\s*\('), "exec()"),
-    (re.compile(r'\b(?:os\.system|subprocess\.(?:call|Popen|run))\s*\('), "python exec"),
+    (re.compile(r'\b(?:os\.system|os\.popen|subprocess\.(?:call|Popen|run|check_output))\s*\('),
+     "python exec"),
     (re.compile(r'\bos\.execute\s*\('), "lua os.execute"),
     (re.compile(r'\bio\.popen\s*\('), "lua io.popen"),
+    (re.compile(r'\b(?:loadstring|load)\s*\('), "lua loadstring"),
     (re.compile(r'\beval\s*\('), "eval()"),
     (re.compile(r'\b(?:shell_exec|passthru|proc_open|pcntl_exec)\s*\('), "php cmd exec"),
     (re.compile(r'\bassert\s*\('), "php assert() (RCE)"),
+    (re.compile(r'\bcreate_function\s*\('), "php create_function() (RCE)"),
+    (re.compile(r'\bchild_process\.(?:exec|execSync|spawn)\s*\('), "node child_process"),
+    (re.compile(r'\bnew\s+Function\s*\('), "js new Function()"),
     (re.compile(r'`[^`]*\$'), "backtick w/ variable"),
+    (re.compile(r'\bopen\s*\([^)]*\|'), "perl 2-arg open() pipe"),
 ]
-# request-data sources
+# request-data sources (taint origins), broadened across languages
 _REQ_SOURCES = re.compile(
-    r'\b(?:QUERY_STRING|REQUEST_METHOD|CONTENT_LENGTH|getenv\s*\(\s*["\']?(?:QUERY|HTTP|REQUEST)|'
-    r'\$_(?:GET|POST|REQUEST|COOKIE|SERVER)|request\.|params\[|argv|read\s*\()',
+    r'\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|'
+    r'\bQUERY_STRING\b|\bHTTP_[A-Z_]+\b|\bCONTENT_LENGTH\b|\bREQUEST_METHOD\b|'
+    r'\bgetenv\s*\(|\$_SERVER\[|php://input|\$ENV\{|\bargv\b|'
+    r'\breq\.(?:query|body|params|cookies|headers)\b|\bparams\[|'
+    r'\bngx\.var\b|\bgetvalue\s*\(|\bFORM\[|\bhaserl',
     re.I)
-# XSS: echoing request data without encoding
+_SOURCE_TOKEN = re.compile(
+    r'\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|\bgetenv\s*\(|\$_SERVER\[|'
+    r'php://input|\bQUERY_STRING\b|\bHTTP_[A-Z_]+\b|\$ENV\{|\breq\.(?:query|body|params)\b|'
+    r'\bngx\.var\b', re.I)
+# validation/encoding that neutralises tainted data (presence -> downgrade)
+_SANITIZERS = re.compile(
+    r'\b(?:escapeshellarg|escapeshellcmd|htmlspecialchars|htmlentities|intval|'
+    r'floatval|ctype_[a-z]+|is_numeric|preg_match|filter_var|filter_input|'
+    r'basename|realpath|addslashes|mysqli?_real_escape_string|pg_escape_\w+|'
+    r'urlencode|rawurlencode|json_encode|quotemeta|str_replace|sprintf\s*\(\s*["\']%d)',
+    re.I)
+# XSS output sinks
 _XSS_SINKS = [
-    (re.compile(r'\becho\s+[^;]*\$_(?:GET|POST|REQUEST)'), "php echo of request data"),
-    (re.compile(r'\bprint(?:f)?\s*\([^)]*\$_(?:GET|POST|REQUEST)'), "php print of request data"),
-    (re.compile(r'document\.write\s*\([^)]*location'), "js DOM XSS (document.write+location)"),
-    (re.compile(r'\.innerHTML\s*=\s*[^;]*(?:location|params|search)'), "js innerHTML sink"),
+    (re.compile(r'\becho\b[^;]*'), "php echo"),
+    (re.compile(r'\bprint(?:f)?\s*\([^)]*'), "php print"),
+    (re.compile(r'document\.write\s*\([^)]*'), "js document.write"),
+    (re.compile(r'\.innerHTML\s*=\s*[^;]*'), "js innerHTML"),
+    (re.compile(r'\bdangerouslySetInnerHTML\b[^;]*'), "react dangerouslySetInnerHTML"),
+    (re.compile(r'\$\([^)]*\)\.html\s*\([^)]*'), "jquery .html()"),
 ]
-# SQLi: string-built queries
-_SQLI = re.compile(r'(?i)(?:select|insert|update|delete)\b[^;\'"]*(?:\$_?(?:GET|POST|REQUEST)|\bargv\b|\+\s*\w+\s*\+)')
+# SQL query builders
+_SQL_SINKS = re.compile(
+    r'\b(?:mysqli?_query|mysqli_?->?query|pg_query|sqlite_query|->query|->exec|'
+    r'db\.query|execute)\s*\(', re.I)
+_SQL_TEXT = re.compile(r'(?i)\b(?:select|insert|update|delete|union)\b')
+# file operations (LFI / traversal)
+_FILE_SINKS = re.compile(
+    r'\b(?:fopen|file_get_contents|readfile|include|include_once|require|'
+    r'require_once|show_source|highlight_file|fpassthru|sendfile|open|io\.open)\s*\(')
 
-_SCRIPT_EXT = {".cgi", ".sh", ".lua", ".php", ".pl", ".py", ".js", ".asp"}
+_SCRIPT_EXT = {".cgi", ".sh", ".lua", ".php", ".php3", ".php5", ".phtml",
+               ".pl", ".py", ".js", ".asp", ".aspx", ".jsp", ".htm", ".html"}
 _WEBROOT_HINTS = ("cgi-bin", "www", "webroot", "htdocs", "web", "html", "wsgi",
-                  "goahead", "lighttpd", "nginx")
+                  "goahead", "lighttpd", "nginx", "webs", "mongoose", "boa")
+
+
+def _matching_paren(text: str, open_idx: int, limit: int = 400) -> str:
+    """Return the argument text inside the call whose '(' is at open_idx."""
+    depth = 0
+    end = min(len(text), open_idx + limit)
+    for i in range(open_idx, end):
+        c = text[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1:i]
+    return text[open_idx + 1:end]
+
+
+def _taint_vars(text: str) -> set[str]:
+    """Lightweight taint: variables assigned (transitively) from a request
+    source. Handles `$c = $_GET['x']` and `$d = $c . '/x'` chains."""
+    tainted: set[str] = set()
+    assigns = re.findall(r'(\$[A-Za-z_]\w*)\s*=\s*([^;\n]{0,200})', text)
+    for _ in range(3):  # fixpoint over a few passes for chained assignments
+        changed = False
+        for var, rhs in assigns:
+            if var in tainted:
+                continue
+            if _SOURCE_TOKEN.search(rhs) or any(t in rhs for t in tainted):
+                tainted.add(var)
+                changed = True
+        if not changed:
+            break
+    return tainted
+
+
+def _arg_tainted(arg: str, tainted: set[str]) -> bool:
+    if _SOURCE_TOKEN.search(arg):
+        return True
+    return any(re.search(re.escape(t) + r'\b', arg) for t in tainted)
 
 
 def check_webapp_sinks(rootfs: str) -> list[Finding]:
@@ -508,47 +577,94 @@ def check_webapp_sinks(rootfs: str) -> list[Finding]:
             text = _read(p)
             rel = _rel(rootfs, p)
             has_source = bool(_REQ_SOURCES.search(text))
-            # RCE: sink present, and request-data source present in same file
+            tainted = _taint_vars(text) if has_source else set()
+
+            def emit(sev, cat, key, title, detail):
+                k = (rel, key)
+                if k in seen:
+                    return
+                seen.add(k)
+                f.append(Finding(sev, cat, title, f"{detail}  @ {rel}", rel))
+
+            # --- RCE: only flag a sink whose OWN ARGUMENT is tainted ---------
             for pat, label in _RCE_SINKS:
-                if pat.search(text):
-                    if has_source:
-                        key = (rel, "rce", label)
-                        if key not in seen:
-                            seen.add(key)
-                            f.append(Finding(Severity.HIGH, "webapp-rce",
-                                             f"command/eval sink {label} with request-data source",
-                                             "possible command injection - trace tainted input",
-                                             rel))
-                    elif in_webish:
-                        key = (rel, "rce-weak", label)
-                        if key not in seen:
-                            seen.add(key)
-                            f.append(Finding(Severity.LOW, "webapp-rce",
-                                             f"command/eval sink {label} in web script",
-                                             "review for tainted input", rel))
+                for m in pat.finditer(text):
+                    op = text.find("(", m.start())
+                    if label.startswith(("backtick", "perl")):
+                        arg = m.group(0)
+                    elif op < 0:
+                        continue
+                    else:
+                        arg = _matching_paren(text, op)
+                    if _arg_tainted(arg, tainted):
+                        if _SANITIZERS.search(arg):
+                            emit(Severity.MEDIUM, "webapp-rce", f"rce-s:{label}",
+                                 f"{label} on request data (a sanitiser is present - verify it covers this path)",
+                                 arg.strip()[:100])
+                        else:
+                            emit(Severity.HIGH, "webapp-rce", f"rce:{label}",
+                                 f"{label} executes request-controlled data (command/code injection)",
+                                 arg.strip()[:100])
+                    elif in_webish and label in ("eval()", "php assert() (RCE)",
+                                                 "lua loadstring", "js new Function()"):
+                        emit(Severity.LOW, "webapp-rce", f"rce-w:{label}",
+                             f"dynamic-eval sink {label} in web script", "review for tainted input")
+
+            # --- XSS: output sink whose argument is tainted -----------------
             for pat, label in _XSS_SINKS:
-                if pat.search(text):
-                    key = (rel, "xss", label)
-                    if key not in seen:
-                        seen.add(key)
-                        f.append(Finding(Severity.MEDIUM, "webapp-xss",
-                                         f"reflected XSS sink: {label}",
-                                         "request data reaches output without encoding", rel))
-            if _SQLI.search(text):
-                key = (rel, "sqli")
-                if key not in seen:
-                    seen.add(key)
-                    f.append(Finding(Severity.MEDIUM, "webapp-sqli",
-                                     "SQL query built from request data",
-                                     "possible SQL injection", rel))
-            # path traversal via request data in file ops
-            if has_source and re.search(r'(?:fopen|open|readfile|include|require|sendfile)\s*\([^)]*(?:\$_|getenv|argv)', text):
-                key = (rel, "lfi")
-                if key not in seen:
-                    seen.add(key)
-                    f.append(Finding(Severity.MEDIUM, "webapp-lfi",
-                                     "file operation on request-controlled path",
-                                     "possible path traversal / LFI", rel))
+                for m in pat.finditer(text):
+                    seg = m.group(0)
+                    if _arg_tainted(seg, tainted):
+                        if re.search(r'htmlspecialchars|htmlentities|json_encode|urlencode', seg, re.I):
+                            continue  # encoded output
+                        emit(Severity.MEDIUM, "webapp-xss", f"xss:{label}",
+                             f"reflected XSS: {label} emits request data unencoded",
+                             seg.strip()[:100])
+                        break
+            # PHP_SELF / SCRIPT_NAME reflected without encoding
+            if re.search(r'\becho\b[^;]*\$_SERVER\[[\'"]?(?:PHP_SELF|REQUEST_URI|SCRIPT_NAME)', text):
+                emit(Severity.MEDIUM, "webapp-xss", "xss:php_self",
+                     "PHP_SELF/REQUEST_URI echoed unencoded (reflected XSS)", "")
+
+            # --- SQLi: query call + SQL keyword + tainted arg ---------------
+            for m in _SQL_SINKS.finditer(text):
+                op = text.find("(", m.start())
+                if op < 0:
+                    continue
+                arg = _matching_paren(text, op)
+                # a query sink is SQL by definition, so a request-tainted arg
+                # (direct concat OR a tainted var built earlier) is enough
+                if _arg_tainted(arg, tainted):
+                    if re.search(r'real_escape|pg_escape|\bbindParam\b|\bbindValue\b|\?\s*[,)]', arg, re.I):
+                        continue  # parameterised / escaped
+                    emit(Severity.HIGH, "webapp-sqli", "sqli",
+                         "request data reaches a SQL query sink (SQL injection)",
+                         arg.strip()[:100])
+                    break
+            else:
+                # string-built query even without a recognised sink call
+                if has_source and re.search(
+                        r'(?i)["\'](?:[^"\']*)(?:select|insert|update|delete)\b[^"\']*["\']?\s*\.\s*\$',
+                        text) and _arg_tainted(text, tainted):
+                    emit(Severity.MEDIUM, "webapp-sqli", "sqli2",
+                         "SQL string concatenated with a variable (possible SQLi)", "")
+
+            # --- LFI / path traversal ---------------------------------------
+            for m in _FILE_SINKS.finditer(text):
+                op = text.find("(", m.start())
+                if op < 0:
+                    continue
+                arg = _matching_paren(text, op)
+                if _arg_tainted(arg, tainted):
+                    if re.search(r'\bbasename\s*\(|\brealpath\s*\(', arg):
+                        sev = Severity.LOW
+                        note = "path is basename/realpath-normalised - verify traversal is blocked"
+                    else:
+                        sev = Severity.HIGH if re.search(r'include|require', m.group(0)) \
+                            else Severity.MEDIUM
+                        note = "request-controlled file path (path traversal / LFI / RFI)"
+                    emit(sev, "webapp-lfi", "lfi", note, arg.strip()[:100])
+                    break
     return f
 
 
@@ -697,6 +813,244 @@ def check_cgi_binaries(rootfs: str) -> list[Finding]:
 
 
 # ---------------------------------------------------------------------------
+# Common PHP / CGI mistakes (dangerous constructs + webshell/backdoor markers)
+# ---------------------------------------------------------------------------
+
+# (compiled regex, severity, label). Each is a well-known footgun in embedded
+# web UIs; matches are leads to confirm, not proof.
+_PHP_RULES = [
+    (re.compile(r'\bpreg_replace\s*\(\s*[\'"][^\'"]*/[a-zA-Z]*e[a-zA-Z]*[\'"]'),
+     Severity.HIGH, "preg_replace /e modifier (code execution)"),
+    (re.compile(r'\bunserialize\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)'),
+     Severity.HIGH, "unserialize() of request data (PHP object injection)"),
+    (re.compile(r'\bextract\s*\(\s*\$_(?:GET|POST|REQUEST)'),
+     Severity.HIGH, "extract() of request data (variable overwrite)"),
+    (re.compile(r'\b(?:include|include_once|require|require_once)\s*'
+                r'(?:\(\s*)?\$_(?:GET|POST|REQUEST|COOKIE)'),
+     Severity.HIGH, "include/require of request data (LFI/RFI)"),
+    (re.compile(r'\beval\s*\(\s*(?:\$_(?:GET|POST|REQUEST|COOKIE)|base64_decode|'
+                r'gzinflate|str_rot13)'),
+     Severity.CRITICAL, "eval() of request/obfuscated data (RCE / webshell)"),
+    (re.compile(r'\b(?:assert|create_function)\s*\(\s*\$_(?:GET|POST|REQUEST)'),
+     Severity.CRITICAL, "assert()/create_function() on request data (RCE)"),
+    (re.compile(r'\b(?:system|exec|shell_exec|passthru|popen|proc_open)\s*\('
+                r'[^;)]*\$_(?:GET|POST|REQUEST|COOKIE|SERVER)'),
+     Severity.CRITICAL, "shell exec of request data (command injection)"),
+    (re.compile(r'\bcall_user_func(?:_array)?\s*\(\s*\$_(?:GET|POST|REQUEST)'),
+     Severity.HIGH, "call_user_func() with request-controlled name"),
+    (re.compile(r'\bmove_uploaded_file\s*\('),
+     Severity.MEDIUM, "file upload handler (move_uploaded_file) - check type/path"),
+    (re.compile(r'\b(?:file_get_contents|fopen|readfile|file)\s*\(\s*'
+                r'\$_(?:GET|POST|REQUEST|COOKIE)'),
+     Severity.HIGH, "file read on request-controlled path (LFI/SSRF)"),
+    (re.compile(r'\bheader\s*\(\s*[\'"]Location:\s*[\'"]?\s*\.\s*\$_'),
+     Severity.MEDIUM, "header('Location:') from request data (open redirect)"),
+    (re.compile(r'==\s*\bmd5\s*\(|\bmd5\s*\([^)]*\)\s*=='),
+     Severity.MEDIUM, "loose == comparison on md5() (PHP magic-hash auth bypass)"),
+    (re.compile(r'\$\$[a-zA-Z_]'),
+     Severity.LOW, "variable variables ($$x) - audit for injection"),
+    (re.compile(r'\bphpinfo\s*\(\s*\)'),
+     Severity.LOW, "phpinfo() present (information disclosure)"),
+    (re.compile(r'@\$_(?:GET|POST|REQUEST|COOKIE)\s*\[[^\]]*\]\s*\('),
+     Severity.CRITICAL, "@$_REQUEST[...]() dynamic call (classic PHP webshell)"),
+    # --- info disclosure ---------------------------------------------------
+    (re.compile(r'\b(?:var_dump|print_r|var_export)\s*\(\s*\$_(?:GET|POST|REQUEST|SERVER)'),
+     Severity.LOW, "var_dump/print_r of request/server data (info disclosure)"),
+    (re.compile(r'\becho\b[^;]*\$_SERVER\[[\'"]?PHP_SELF'),
+     Severity.MEDIUM, "PHP_SELF echoed (reflected XSS)"),
+    # --- SSRF / RFI --------------------------------------------------------
+    (re.compile(r'\b(?:curl_setopt[^;]*CURLOPT_URL|fsockopen|stream_socket_client|'
+                r'file_get_contents)\s*\([^;]*\$_(?:GET|POST|REQUEST)'),
+     Severity.HIGH, "outbound request to request-controlled URL (SSRF)"),
+    # --- XXE ---------------------------------------------------------------
+    (re.compile(r'\blibxml_disable_entity_loader\s*\(\s*false\s*\)'),
+     Severity.HIGH, "libxml_disable_entity_loader(false) - XXE enabled"),
+    (re.compile(r'\b(?:simplexml_load_string|simplexml_load_file|DOMDocument'
+                r'[^;]*->load)[^;]*(?:LIBXML_NOENT|\$_(?:GET|POST|REQUEST))'),
+     Severity.HIGH, "XML parse of request data with entities (XXE)"),
+    # --- HTTP header / CRLF injection --------------------------------------
+    (re.compile(r'\bheader\s*\([^)]*\$_(?:GET|POST|REQUEST|COOKIE|SERVER)'),
+     Severity.MEDIUM, "header() built from request data (HTTP response splitting)"),
+    (re.compile(r'\bsetcookie\s*\([^)]*\$_(?:GET|POST|REQUEST)'),
+     Severity.LOW, "setcookie() value from request data"),
+    # --- weak crypto / RNG for security tokens -----------------------------
+    (re.compile(r'\b(?:session_id|token|csrf|nonce|salt|password)\b[^;\n]{0,40}'
+                r'\b(?:mt_rand|rand|uniqid|microtime)\s*\(', re.I),
+     Severity.MEDIUM, "predictable RNG (rand/uniqid) used for a security token"),
+    (re.compile(r'\b(?:password|passwd|pwd)\b[^;\n]{0,20}\b(?:md5|sha1)\s*\(', re.I),
+     Severity.MEDIUM, "password hashed with md5/sha1 (fast, unsalted - crackable)"),
+    (re.compile(r'\bmcrypt_\w+\s*\('),
+     Severity.LOW, "mcrypt used (removed/insecure crypto API)"),
+    # --- request-var pollution / auth --------------------------------------
+    (re.compile(r'\bparse_str\s*\(\s*\$_SERVER\[[\'"]?QUERY_STRING[\'"]?\]\s*\)'),
+     Severity.HIGH, "parse_str() without result array (register_globals-style overwrite)"),
+    (re.compile(r'\bimport_request_variables\s*\('),
+     Severity.HIGH, "import_request_variables() (request->global overwrite)"),
+    (re.compile(r'\bstrcmp\s*\([^)]*\$_(?:GET|POST|REQUEST)[^)]*\)\s*==\s*0'),
+     Severity.MEDIUM, "strcmp()==0 auth check on request data (array-bypass to NULL)"),
+    (re.compile(r'\bmail\s*\([^;]*,[^;]*,[^;]*,[^;]*,\s*\$_(?:GET|POST|REQUEST)'),
+     Severity.MEDIUM, "mail() 5th arg from request data (params/sendmail injection)"),
+    # --- CORS wildcard in code --------------------------------------------
+    (re.compile(r'header\s*\(\s*[\'"]Access-Control-Allow-Origin:\s*\*'),
+     Severity.MEDIUM, "CORS Access-Control-Allow-Origin: * set in code"),
+]
+
+# Lua (haserl / lua-CGI / openresty) request->sink mistakes
+_LUA_RULES = [
+    (re.compile(r'\bos\.execute\s*\([^)]*(?:ngx\.var|FORM\[|getvalue|arg\[|\bENV\b)'),
+     Severity.CRITICAL, "lua os.execute() with request data (command injection)"),
+    (re.compile(r'\bio\.popen\s*\([^)]*(?:ngx\.var|FORM\[|getvalue|arg\[)'),
+     Severity.HIGH, "lua io.popen() with request data"),
+    (re.compile(r'\b(?:loadstring|load)\s*\([^)]*(?:ngx\.var|FORM\[|getvalue)'),
+     Severity.CRITICAL, "lua loadstring/load() of request data (code injection)"),
+    (re.compile(r'\bngx\.location\.capture\s*\([^)]*ngx\.var'),
+     Severity.MEDIUM, "ngx.location.capture() to request-controlled URI (SSRF)"),
+]
+
+# client-side (served .js/.html) DOM XSS
+_JS_RULES = [
+    (re.compile(r'\.innerHTML\s*=\s*[^;]*(?:location|document\.URL|\.search|\.hash|params)'),
+     Severity.MEDIUM, "innerHTML assigned from location/URL (DOM XSS)"),
+    (re.compile(r'document\.write\s*\([^)]*(?:location|document\.URL|\.search|\.hash)'),
+     Severity.MEDIUM, "document.write() of location/URL (DOM XSS)"),
+    (re.compile(r'\beval\s*\([^)]*(?:location|\.search|\.hash|params)'),
+     Severity.HIGH, "eval() of URL-derived data (DOM XSS -> code exec)"),
+    (re.compile(r'\bnew\s+Function\s*\([^)]*(?:location|\.search|\.hash)'),
+     Severity.HIGH, "new Function() from URL data"),
+]
+
+_CGI_RULES = [
+    (re.compile(r'\beval\s+["\']?\$(?:QUERY_STRING|HTTP_|CONTENT)'),
+     Severity.CRITICAL, "shell eval of CGI request var (command injection)"),
+    (re.compile(r'`[^`]*\$(?:QUERY_STRING|HTTP_[A-Z_]+|CONTENT_LENGTH)'),
+     Severity.HIGH, "backtick command using CGI request var"),
+    (re.compile(r'\b(?:system|exec|`)[^;\n]*\$ENV\{(?:QUERY_STRING|HTTP_)'),
+     Severity.HIGH, "perl CGI exec of %ENV request var"),
+    (re.compile(r'\becho\s+\$(?:QUERY_STRING|HTTP_[A-Z_]+)\b'),
+     Severity.MEDIUM, "echo of CGI request var (reflected XSS)"),
+    (re.compile(r'\bopen\s*\([^)]*\$(?:ENV\{|q\b)[^)]*\|'),
+     Severity.HIGH, "perl 2-arg open() pipe with tainted data (command injection)"),
+]
+
+_PHP_EXT = {".php", ".php3", ".php4", ".php5", ".phtml", ".inc"}
+_CGI_EXT = {".cgi", ".sh", ".pl"}
+_LUA_EXT = {".lua"}
+_JS_EXT = {".js", ".htm", ".html"}
+
+
+def check_php_cgi_mistakes(rootfs: str) -> list[Finding]:
+    f = []
+    seen = set()
+    for dirpath, _, files in os.walk(rootfs):
+        low_dir = dirpath.lower()
+        in_webish = any(h in low_dir for h in _WEBROOT_HINTS)
+        for name in files:
+            ext = os.path.splitext(name)[1].lower()
+            is_php = ext in _PHP_EXT
+            is_cgi = ext in _CGI_EXT
+            is_lua = ext in _LUA_EXT
+            is_js = ext in _JS_EXT
+            # only scan .js/.html when they live in a web dir (avoid vendored libs noise)
+            if is_js and not in_webish:
+                continue
+            if not (is_php or is_cgi or is_lua or is_js):
+                continue
+            p = os.path.join(dirpath, name)
+            try:
+                if os.path.getsize(p) > _MAX:
+                    continue
+            except OSError:
+                continue
+            text = _read(p)
+            rel = _rel(rootfs, p)
+            rules = []
+            if is_php:
+                rules = _PHP_RULES + _CGI_RULES  # php may shell out via backticks
+            elif is_cgi:
+                rules = _CGI_RULES
+            elif is_lua:
+                rules = _LUA_RULES
+            elif is_js:
+                rules = _JS_RULES
+            for pat, sev, label in rules:
+                m = pat.search(text)
+                if not m:
+                    continue
+                key = (rel, label)
+                if key in seen:
+                    continue
+                seen.add(key)
+                snip = m.group(0)[:100]
+                cat = ("webapp-php" if is_php else "webapp-lua" if is_lua
+                       else "webapp-xss" if is_js else "webapp-cgi")
+                f.append(Finding(sev, cat, f"{label}", f"{snip}  @ {rel}", rel))
+    # php.ini dangerous directives
+    for p in _find_files(rootfs, "**/php.ini", "etc/php*/php.ini", "**/php*.ini"):
+        rel = _rel(rootfs, p)
+        low = _read(p).lower()
+        if re.search(r'allow_url_include\s*=\s*on', low):
+            f.append(Finding(Severity.HIGH, "webapp-php",
+                             "php.ini allow_url_include=On (remote file include)",
+                             path=rel))
+        if re.search(r'allow_url_fopen\s*=\s*on', low):
+            f.append(Finding(Severity.LOW, "webapp-php",
+                             "php.ini allow_url_fopen=On (SSRF surface)", path=rel))
+        if re.search(r'display_errors\s*=\s*on', low):
+            f.append(Finding(Severity.LOW, "webapp-php",
+                             "php.ini display_errors=On (info disclosure)", path=rel))
+        if re.search(r'register_globals\s*=\s*on', low):
+            f.append(Finding(Severity.HIGH, "webapp-php",
+                             "php.ini register_globals=On (legacy, dangerous)",
+                             path=rel))
+    return f
+
+
+# ---------------------------------------------------------------------------
+# Web-root hygiene: files that shouldn't be served
+# ---------------------------------------------------------------------------
+
+_BACKUP_RE = re.compile(r'\.(?:bak|old|orig|save|swp|swo|tmp|inc|~)$|~$|'
+                        r'\.(?:php|asp|cgi|lua)\.(?:bak|old|txt|dist|sample)$', re.I)
+_VCS_DIRS = (".git", ".svn", ".hg", "cvs")
+_EXPOSED_NAMES = ("config.php", "configuration.php", "wp-config.php",
+                  "settings.php", "database.php", "db.php", ".env",
+                  "phpinfo.php", "info.php", "test.php", "adminer.php",
+                  "id_rsa", "id_dsa", ".htpasswd", ".git-credentials")
+
+
+def check_webroot_hygiene(rootfs: str) -> list[Finding]:
+    f = []
+    for dirpath, dirnames, files in os.walk(rootfs):
+        low_dir = dirpath.lower().replace("\\", "/")
+        if not any(h in low_dir for h in _WEBROOT_HINTS):
+            continue
+        rel_dir = _rel(rootfs, dirpath)
+        # VCS metadata served from the docroot leaks full source/history
+        for vcs in _VCS_DIRS:
+            if vcs in [d.lower() for d in dirnames]:
+                f.append(Finding(Severity.HIGH, "webroot",
+                                 f"{vcs} directory inside web root: {rel_dir}/{vcs}",
+                                 "source/history/credentials downloadable over HTTP",
+                                 f"{rel_dir}/{vcs}"))
+        for name in files:
+            rel = _rel(rootfs, os.path.join(dirpath, name))
+            low = name.lower()
+            if _BACKUP_RE.search(low):
+                f.append(Finding(Severity.MEDIUM, "webroot",
+                                 f"editor/backup file served from web root: {rel}",
+                                 "may expose source or credentials verbatim", rel))
+            if low in _EXPOSED_NAMES:
+                sev = Severity.HIGH if low in (
+                    "config.php", "wp-config.php", ".env", "database.php",
+                    "db.php", "id_rsa", "id_dsa", ".htpasswd") else Severity.MEDIUM
+                f.append(Finding(sev, "webroot",
+                                 f"sensitive file in web root: {rel}",
+                                 "downloadable / info-disclosure if not access-controlled",
+                                 rel))
+    return f
+
+
+# ---------------------------------------------------------------------------
 # aggregate
 # ---------------------------------------------------------------------------
 
@@ -705,7 +1059,7 @@ ALL_CHECKS = [
     check_nginx, check_lighttpd, check_apache, check_boa_goahead,
     check_wifi, check_dns, check_misc_services, check_webapp_sinks,
     check_tr069, check_upnp, check_vpn_tls, check_rtsp_onvif,
-    check_cgi_binaries,
+    check_cgi_binaries, check_php_cgi_mistakes, check_webroot_hygiene,
 ]
 
 

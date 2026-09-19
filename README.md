@@ -40,6 +40,9 @@ python -m fwre creds path/to/rootfs --wordlist mypasswords.txt
 # per-binary hardening report (checksec)
 python -m fwre checksec rootfs/usr/sbin/httpd rootfs/bin/busybox
 
+# rank the unusual / vendor binaries worth opening in a disassembler first
+python -m fwre interesting path/to/rootfs
+
 # parse a serial boot log (or auto-find a sibling *.bootlog.txt)
 python -m fwre bootlog firmware/hugolog_e5-...-atbm6012bx.bootlog.txt
 
@@ -91,6 +94,7 @@ subprocess and are **not** bundled — keep them on PATH on the target machine.
 | `analyze.py` (credentials) | passwd/shadow parsing, empty passwords, UID-0 aliases, weak DES/md5 hashes, hashcat mode hints |
 | `analyze.py` (secrets) | private keys, TLS certs, API tokens (AWS/GCP/GitHub/JWT), Wi-Fi PSKs, hardcoded secret assignments |
 | `elf.py` + `analyze.py` | **checksec**: arch/endian/bits, static/stripped, NX, PIE, RELRO, stack canary, FORTIFY, RPATH; dangerous libc imports; setuid & network-daemon flagging |
+| `interesting.py` | **interesting / unusual binaries** — ranks every ELF by how much it stands out from the rest of the image (custom/vendor executables & kernel modules, proprietary SDK libs, packing, RWX, odd filesystem locations, arch/toolchain/size/strip **outliers vs the image's own population**, suspicious name tokens, heavy dangerous-import use) so you know what to open first. Leads for manual RE, not vulnerabilities — pure stdlib, reuses the checksec parse |
 | `services.py` | **service misconfigs**: sshd/dropbear, telnet/inetd, FTP (vsftpd/proftpd/bftpd), nginx, lighttpd, apache, boa/goahead, wpa_supplicant/hostapd, unbound/dnsmasq, samba, mosquitto (MQTT), NTP, SNMP; plus web-app **RCE / XSS / SQLi / LFI** sinks in CGI/Lua/PHP/shell |
 | `analyze.py` (attack surface) | init scripts (`inittab`, `init.d/rcS`), started daemons, direct-shell telnetd, gdbserver/debug shells |
 | `cvedb.py` | component fingerprinting (busybox, dropbear, openssl, kernel, U-Boot, mbedTLS, sqlite, expat, curl, …) + curated high-impact CVE rules (always available, offline) |
@@ -105,7 +109,9 @@ subprocess and are **not** bundled — keep them on PATH on the target machine.
 | `fsaudit.py` | filesystem **permission** audit: SUID/SGID, world-writable files/dirs, writable init scripts, loose key perms (auto-skips when Windows extraction drops modes) |
 | `busybox.py` | **BusyBox applet** enumeration + dangerous-applet flagging (telnetd/nc/tftp/wget/crond), symlink-exposure aware |
 | `correlate.py` | **cross-image (fleet)** correlation in `batch`: shared `/etc/shadow` hashes, shared certs/keys, reused cracked passwords across the corpus |
+| `services.py` (web-app) | **taint- & sanitizer-aware** RCE/XSS/SQLi/LFI detection (tracks request data through variable assignments; ignores literal/`escapeshellarg`/parameterised/encoded args) across PHP/CGI/**Lua**/JS; plus **common PHP/CGI mistakes** (eval/`system`/`include`/`unserialize`/`extract` on request data, `preg_replace /e`, SSRF, XXE, header/CRLF injection, weak RNG/hash for tokens, `md5` magic-hash auth, php.ini `allow_url_include`, webshell markers) and **web-root hygiene** (`.git`/`.svn` in docroot, `.bak`/`~`/`config.php` served) |
 | `services.py` (cont.) | adds TR-069/CWMP, UPnP/miniupnpd, OpenVPN/stunnel/IPsec keys, RTSP/ONVIF auth, and **compiled-CGI** (C `httpd`) command-injection detection |
+| `squashfs.py` | **perm-preserving SquashFS extraction** (via `dissect.squashfs`) — records real st_mode/uid/gid/symlinks in a manifest so the permission audit is accurate even on Windows (where 7z drops modes) |
 | `sbom.py` | **CycloneDX 1.5** SBOM export (`--sbom`, or `fwre sbom`) from the fingerprinted component/CVE set |
 
 ## CVE corpus
@@ -135,7 +141,26 @@ present, corpus matches are added on top of the curated rules. To refresh, run
 
 ## Output
 
-- Console: severity-sorted finding list + a recovered-credentials table.
+- Console: a colour-coded, severity-sorted finding list (secrets are printed
+  with their value and exact location — `path:line` for text, `path @ 0xOFFSET`
+  for a key embedded in a binary) + a recovered-credentials table. A `fwRE`
+  banner prints at startup. Disable with `--nocolors` / `--nologo` (or
+  `NO_COLOR=1`); colour is auto-off when stdout isn't a terminal.
+
+### Interactive post-analysis phases
+
+After the findings print, two optional phases run (console mode only, never with
+`--json`):
+
+- **Secret dump** — for each located secret it asks `y/N` whether to dump the
+  full material (the whole PEM block for a key at its binary offset) to
+  `fwre_secrets/<image>/`. `--dumpsecrets` dumps all without prompting;
+  `--skipdumpsecrets` prints a note and skips.
+- **Hash crack-assist** — prints each `/etc/shadow` hash and, for **fast** types
+  (descrypt/md5crypt), offers to generate a hashcat command and **run** or
+  **save** it; **slow** types (sha256/512crypt, bcrypt, yescrypt) only get a
+  saved wordlist-based command. Saved scripts are OS-native — `.bat` on Windows,
+  `.sh` on Linux. `--crack` saves all non-interactively; `--skipcrack` skips.
 - `-o report.md`: full Markdown report (findings, creds, components/CVEs, a
   checksec table, network IOCs).
 - `--json`: machine-readable output for tooling / diffing across firmware.
@@ -152,8 +177,11 @@ embedded private keys) → `HIGH` → `MEDIUM` → `LOW` → `INFO`. See
 fwre/
   __main__.py    python -m fwre
   cli.py         argparse front-end (extract/analyze/run/batch/creds/cvedb/checksec/strings/bootlog/uboot/sbom)
-  extract.py     7z driver + magic-locate carve fallback
+  extract.py     7z driver + magic-locate carve fallback (+ builtin squashfs)
+  squashfs.py    perm-preserving SquashFS extractor (dissect.squashfs)
+  term.py        colour output + figlet banner (--nocolors / --nologo)
   elf.py         pure-python ELF parser + checksec (+ .comment, RWX, packed, static dangerous-func scan)
+  interesting.py ranks the unusual / vendor / outlier binaries worth manual RE
   analyze.py     rootfs orchestrator + credential/secret/binary/attack-surface/IOC analyzers
   services.py    per-service misconfig + web-app sink analyzers (+ TR-069/UPnP/VPN/RTSP/compiled-CGI)
   defaults.py    default/weak credential recovery (+ sudoers / cred-backup files)

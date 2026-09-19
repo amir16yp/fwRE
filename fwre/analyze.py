@@ -6,12 +6,14 @@ top-level analyze_rootfs() runs them all and also gathers structured artifacts
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
+import shlex
 import stat
 from dataclasses import dataclass, field
 
-from .finding import Finding, Severity
+from .finding import Finding, Severity, Site, sites_note
 from . import elf as elfmod
 from . import cvedb
 from . import services as svcmod
@@ -22,7 +24,9 @@ from . import busybox as bbmod
 from . import cloud as cloudmod
 from . import bootlog as bootlogmod
 from . import uboot as ubootmod
-from .strings_util import strings_file
+from . import interesting as intmod
+from . import netcalls as netmod
+from .strings_util import strings_file, strings, strings_with_offsets
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -60,9 +64,14 @@ def _is_probably_text(path: str) -> bool:
     return True
 
 
+_SKIP_NAMES = {".fwre_perms.json"}
+
+
 def _walk_files(rootfs: str):
     for dirpath, _, files in os.walk(rootfs):
         for f in files:
+            if f in _SKIP_NAMES:
+                continue
             yield os.path.join(dirpath, f)
 
 
@@ -237,6 +246,127 @@ _ENTROPY_ASSIGN = re.compile(
 _KEY_FILE_EXT = {".key", ".pem"}
 
 
+_VAR_REF = re.compile(r"^\$\{?(\w+)\}?$|^%(\w+)%$")
+
+
+def _deref_var(val: str, text: str, depth: int = 0) -> tuple[str, bool]:
+    """If `val` is a variable reference ($VAR / ${VAR} / %VAR%), resolve it to
+    the value assigned in the same file (transitively). Returns
+    (resolved_value, was_resolved). This makes `password=$WIFIPWD` dump the real
+    password defined elsewhere in the script, not the literal '$WIFIPWD'."""
+    if not val or depth > 4:
+        return val, depth > 0
+    m = _VAR_REF.match(val.strip())
+    if not m:
+        return val, depth > 0
+    name = m.group(1) or m.group(2)
+    for pat in (rf"(?m)^[ \t]*(?:export[ \t]+|set[ \t]+)?{re.escape(name)}[ \t]*=[ \t]*(.+)$",
+                rf"(?m)^[ \t]*{re.escape(name)}[ \t]*:[ \t]*(.+)$"):
+        mm = re.search(pat, text)
+        if mm:
+            rhs = mm.group(1).strip()
+            # strip trailing comment and surrounding quotes
+            rhs = re.split(r"\s+#", rhs)[0].strip().strip('"\'').strip()
+            if rhs and rhs != val:
+                return _deref_var(rhs, text, depth + 1)
+    return val, depth > 0  # referenced but not defined in this file
+
+
+_POSITIONAL = re.compile(r"^\$\{?(\d+)\}?$")
+_SCRIPT_EXTS = (".sh", ".cgi", ".rc", ".bash", "")
+
+
+@functools.lru_cache(maxsize=4)
+def _script_index(rootfs: str) -> tuple:
+    """(rel, text) for every shell-ish script in the rootfs (cached). Used to
+    find where a script is invoked so positional parameters can be resolved."""
+    out = []
+    for dirpath, _, files in os.walk(rootfs):
+        for name in files:
+            ext = os.path.splitext(name)[1].lower()
+            p = os.path.join(dirpath, name)
+            try:
+                if os.path.getsize(p) > 512 * 1024:
+                    continue
+                with open(p, "rb") as fh:
+                    data = fh.read(512 * 1024)
+            except OSError:
+                continue
+            if b"\x00" in data[:2048]:
+                continue
+            if ext not in _SCRIPT_EXTS and not data.startswith(b"#!"):
+                continue
+            rel = os.path.relpath(p, rootfs).replace("\\", "/")
+            out.append((rel, data.decode("latin1", "replace")))
+    return tuple(out)
+
+
+def _call_args(text: str, base: str) -> list[list[str]]:
+    """Return the argument lists for each invocation of `base` in `text`."""
+    results = []
+    pat = re.compile(r"""(?:^|[\s;&|`(=])(?:[^\s;&|`'"]*/)?""" + re.escape(base) +
+                     r"[ \t]+([^\n;&|)]+)")
+    for m in pat.finditer(text):
+        argstr = m.group(1).strip()
+        try:
+            args = shlex.split(argstr, posix=True)
+        except ValueError:
+            args = argstr.split()
+        if args:
+            results.append(args)
+    return results
+
+
+def _resolve_positional(script_rel: str, idx: int, rootfs: str,
+                        depth: int, seen: frozenset) -> str | None:
+    """Find callers of `script_rel` and resolve its $idx positional argument,
+    recursing when the caller passes one of *its own* positionals."""
+    if depth >= 6:
+        return None
+    base = os.path.basename(script_rel)
+    for caller_rel, caller_text in _script_index(rootfs):
+        if caller_rel == script_rel or caller_rel in seen:
+            continue
+        for args in _call_args(caller_text, base):
+            if 1 <= idx <= len(args):
+                v, _ = _resolve_value(args[idx - 1], caller_text, caller_rel,
+                                      rootfs, depth + 1, seen | {caller_rel})
+                if v and not _POSITIONAL.match(v.strip()) \
+                        and not _VAR_REF.match(v.strip()):
+                    return v
+    return None
+
+
+def _resolve_value(val: str, text: str, rel: str, rootfs: str | None = None,
+                   depth: int = 0, seen: frozenset = frozenset()
+                   ) -> tuple[str, bool]:
+    """Resolve a secret value smartly: same-file variable deref, then (for a
+    positional parameter) follow the call graph to the argument actually passed."""
+    original = val
+    val, ref = _deref_var(val, text)
+    pm = _POSITIONAL.match((val or "").strip())
+    if pm and rootfs and depth < 6:
+        res = _resolve_positional(rel, int(pm.group(1)), rootfs, depth,
+                                  seen | {rel})
+        if res is not None:
+            return res, True
+    return val, ref or (val != original)
+
+
+def _printable_secret(val: str, limit: int = 100) -> str:
+    """Return the secret value for display if it is reasonably printable, else
+    an empty string. Keeps control-char / binary blobs out of the output."""
+    if not val:
+        return ""
+    v = val.strip()
+    if not v.isprintable() or len(v) > limit:
+        # for long-but-printable blobs (e.g. PEM headers) show a head slice
+        if v.isprintable() and len(v) > limit:
+            return v[:limit - 3] + "..."
+        return ""
+    return v
+
+
 def _shannon(s: str) -> float:
     import math
     if not s:
@@ -251,8 +381,29 @@ def _shannon(s: str) -> float:
 _SECRET_ELF_MAX = 32 * 1024 * 1024
 
 
-def analyze_secrets(rootfs: str) -> list[Finding]:
+@dataclass
+class SecretHit:
+    """A recovered secret and exactly where it lives, for optional dumping."""
+    desc: str
+    value: str
+    rel: str
+    abs_path: str
+    is_binary: bool = False
+    offset: int | None = None      # byte offset into the file (binaries)
+    line: int | None = None        # 1-based line (text files)
+    is_pem: bool = False           # multi-line PEM block worth full extraction
+
+    def where(self) -> str:
+        if self.offset is not None:
+            return f"{self.rel} @ 0x{self.offset:x}"
+        if self.line is not None:
+            return f"{self.rel}:{self.line}"
+        return self.rel
+
+
+def analyze_secrets(rootfs: str) -> tuple[list[Finding], list[SecretHit]]:
     findings: list[Finding] = []
+    secrets: list[SecretHit] = []
     seen_msgs: set[tuple[str, str, str]] = set()
     for path in _walk_files(rootfs):
         rel = _rel(rootfs, path)
@@ -262,6 +413,9 @@ def analyze_secrets(rootfs: str) -> list[Finding]:
             findings.append(Finding(
                 Severity.HIGH, "secrets", f"key/cert file present: {rel}",
                 path=rel))
+            secrets.append(SecretHit(
+                desc="key/cert file", value=rel, rel=rel, abs_path=path,
+                is_pem=True))
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -277,12 +431,28 @@ def analyze_secrets(rootfs: str) -> list[Finding]:
                                  or ext in (".so", ".bin", ".ko")
                                  or ".so." in os.path.basename(rel)):
                 continue
-            text = "\n".join(strings_file(path, min_len=6,
-                                          max_read=_SECRET_ELF_MAX))
+            cap = _SECRET_ELF_MAX
         else:
             if size > _MAX_TEXT:
                 continue
-            text = _read_text(path)
+            cap = _MAX_TEXT
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(cap)
+        except OSError:
+            continue
+        text = "\n".join(strings(raw, min_len=6)) if is_binary \
+            else raw.decode("latin1", "replace")
+
+        def _loc(match_text: str, pos: int):
+            """Exact location: `path:line` for text, `path @ 0xOFFSET` (byte
+            offset) for binaries. Returns (loc_str, offset|None, line|None)."""
+            if is_binary:
+                off = raw.find(match_text[:120].encode("latin1", "replace"))
+                off = off if off >= 0 else None
+                return (f"{rel} @ 0x{off:x}" if off is not None else rel), off, None
+            line = text.count(chr(10), 0, pos) + 1
+            return f"{rel}:{line}", None, line
 
         lib_vec = is_binary and certmod._is_crypto_lib(rel)
         for pat, sev, desc in _SECRET_PATTERNS:
@@ -290,19 +460,36 @@ def analyze_secrets(rootfs: str) -> list[Finding]:
             # usually unused - don't raise them as embedded firmware secrets
             if lib_vec and ("private key" in desc or "certificate" in desc):
                 continue
+            # the loose key=value pattern is noisy against binary string tables
+            # (matches help text) - keep it to text/config files only
+            if is_binary and desc == "hardcoded credential assignment":
+                continue
             for m in pat.finditer(text):
-                val = m.group(m.lastindex) if m.lastindex else m.group(0)
+                raw_val = m.group(m.lastindex) if m.lastindex else m.group(0)
+                # resolve $VAR/${VAR}/%VAR% in-file, and positional params ($2)
+                # by following the call graph to the argument actually passed
+                val, was_ref = _resolve_value(raw_val, text, rel,
+                                              None if is_binary else rootfs)
                 if val and ("%" in val or val in ("...", "xxx", "yyy", "xxxx")):
                     continue
-                snippet = m.group(0)
-                if len(snippet) > 80:
-                    snippet = snippet[:77] + "..."
-                key = (rel, desc, snippet)
+                full = m.group(0)
+                snippet = full[:77] + "..." if len(full) > 80 else full
+                loc, off, line = _loc(full, m.start())
+                key = (loc, desc, snippet)
                 if key in seen_msgs:
                     continue
                 seen_msgs.add(key)
-                findings.append(Finding(sev, "secrets", desc,
-                                        detail=snippet, path=rel))
+                # surface the actual secret value + exactly where it lives
+                shown = _printable_secret(val)
+                ref_note = f"  (resolved from {raw_val})" if was_ref else ""
+                title = f"{desc}: {shown}{ref_note}" if shown else desc
+                detail = snippet + (f"  [{raw_val} -> {shown}]" if was_ref else "")
+                findings.append(Finding(sev, "secrets", title,
+                                        detail=detail, path=loc))
+                secrets.append(SecretHit(
+                    desc=desc, value=val, rel=rel, abs_path=path,
+                    is_binary=is_binary, offset=off, line=line,
+                    is_pem=("BEGIN" in full)))
 
         # entropy-gated generic secret assignments (cuts placeholder noise)
         for m in _ENTROPY_ASSIGN.finditer(text):
@@ -311,15 +498,21 @@ def analyze_secrets(rootfs: str) -> list[Finding]:
                 continue
             if _shannon(val) < 3.5:
                 continue
-            key = (rel, "high-entropy secret", val[:24])
+            loc, off, line = _loc(m.group(0), m.start())
+            key = (loc, "high-entropy secret", val[:24])
             if key in seen_msgs:
                 continue
             seen_msgs.add(key)
+            shown = _printable_secret(val)
+            title = (f"high-entropy secret assignment: {shown}" if shown
+                     else "high-entropy secret assignment")
             findings.append(Finding(
-                Severity.MEDIUM, "secrets",
-                "high-entropy secret assignment",
-                detail=(m.group(0)[:80]), path=rel))
-    return findings
+                Severity.MEDIUM, "secrets", title,
+                detail=m.group(0)[:80], path=loc))
+            secrets.append(SecretHit(
+                desc="high-entropy secret", value=val, rel=rel, abs_path=path,
+                is_binary=is_binary, offset=off, line=line))
+    return findings, secrets
 
 
 # ---------------------------------------------------------------------------
@@ -637,11 +830,44 @@ _CLOUD_HINTS = ("amazonaws", "aliyun", "aliyuncs", "tuya", "tutk", "iotcplatform
                 "xmeye", "cloud", "mqtt", "ntp", "firmware", "ota", "update")
 
 
+# how many distinct sites we keep (and print) per IOC value; the rest are
+# summarised as "+N more" so a string repeated across a whole rootfs doesn't
+# blow up the report
+_MAX_IOC_SITES = 5
+
+
+# an IOC sighting is just a Site (see finding.Site)
+IocSite = Site
+
+
+def _ioc_matches(s: str):
+    """Yield (kind, value, char_index) for every IOC inside one string/line."""
+    for m in _URL_RE.finditer(s):
+        yield "url", m.group(0), m.start()
+    for m in _IP_RE.finditer(s):
+        ip = m.group(0)
+        first = ip.split(".")[0]
+        if first.isdigit() and 0 < int(first) < 240 and ip not in ("0.0.0.0",):
+            yield "ip", ip, m.start()
+    for m in _DOMAIN_RE.finditer(s):
+        yield "domain", m.group(0).lower(), m.start()
+    for m in _MAC_RE.finditer(s):
+        mac = m.group(0).lower()
+        if mac not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+            yield "mac", mac, m.start()
+
+
 def analyze_network_iocs(rootfs: str) -> tuple[list[Finding], dict]:
-    urls: set[str] = set()
-    ips: set[str] = set()
-    domains: set[str] = set()
-    macs: set[str] = set()
+    sites: dict[tuple[str, str], list[IocSite]] = {}
+    counts: dict[tuple[str, str], int] = {}
+
+    def add(kind: str, value: str, site: IocSite) -> None:
+        key = (kind, value)
+        counts[key] = counts.get(key, 0) + 1
+        lst = sites.setdefault(key, [])
+        if len(lst) < _MAX_IOC_SITES:
+            lst.append(site)
+
     for path in _walk_files(rootfs):
         rel = _rel(rootfs, path)
         try:
@@ -651,29 +877,46 @@ def analyze_network_iocs(rootfs: str) -> tuple[list[Finding], dict]:
         if size > 16 * 1024 * 1024:
             continue
         if elfmod.is_elf(path):
-            text = "\n".join(strings_file(path, min_len=6, max_read=16 * 1024 * 1024))
+            # binary: record the file offset of the match (and the virtual
+            # address it maps to, so it can be looked up in a disassembler)
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read(16 * 1024 * 1024)
+            except OSError:
+                continue
+            segs = elfmod.load_segments(data)
+            for off, s, width in strings_with_offsets(data, min_len=6):
+                for kind, value, i in _ioc_matches(s):
+                    fo = off + i * width
+                    va = elfmod.vaddr_for_offset(segs, fo)
+                    add(kind, value, IocSite(path=rel, offset=fo,
+                                             vaddr=-1 if va is None else va))
         elif _is_probably_text(path):
-            text = _read_text(path)
+            # text: record the line number of the match
+            for lineno, line in enumerate(_read_text(path).splitlines(), 1):
+                for kind, value, _i in _ioc_matches(line):
+                    add(kind, value, IocSite(path=rel, line=lineno))
         else:
             continue
-        for m in _URL_RE.finditer(text):
-            urls.add(m.group(0))
-        for m in _IP_RE.finditer(text):
-            ip = m.group(0)
-            first = ip.split(".")[0]
-            if first.isdigit() and 0 < int(first) < 240 and ip not in ("0.0.0.0",):
-                ips.add(ip)
-        for m in _DOMAIN_RE.finditer(text):
-            domains.add(m.group(0).lower())
-        for m in _MAC_RE.finditer(text):
-            mac = m.group(0).lower()
-            if mac not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
-                macs.add(mac)
+
+    def values(kind: str) -> list[str]:
+        return sorted(v for (k, v) in sites if k == kind)
+
+    urls, ips = values("url"), values("ip")
+    domains, macs = values("domain"), values("mac")
+
+    def loc(kind: str, value: str) -> tuple[str, str]:
+        """(primary location, 'found at ...' note) for one IOC value."""
+        lst = sites.get((kind, value), [])
+        if not lst:
+            return "", ""
+        return lst[0].where(), sites_note(lst, counts[(kind, value)])
 
     findings: list[Finding] = []
-    for u in sorted(urls):
+    for u in urls:
         ul = u.lower()
         sev = Severity.LOW
+        at, note = loc("url", u)
         is_ota = any(h in ul for h in _OTA_HINTS)
         is_p2p = any(h in ul for h in _P2P_HINTS)
         if u.startswith("http://") and is_ota:
@@ -681,29 +924,39 @@ def analyze_network_iocs(rootfs: str) -> tuple[list[Finding], dict]:
             findings.append(Finding(
                 Severity.HIGH, "network-ioc",
                 f"cleartext OTA/update endpoint: {u}",
-                "unauthenticated HTTP firmware fetch - MITM to implant", path=""))
+                "unauthenticated HTTP firmware fetch - MITM to implant; "
+                + note, path=at))
             continue
         if is_p2p:
             findings.append(Finding(
                 Severity.MEDIUM, "network-ioc",
                 f"P2P/cloud control endpoint: {u}",
-                "device phone-home / remote-access infrastructure", path=""))
+                "device phone-home / remote-access infrastructure; "
+                + note, path=at))
             continue
         if u.startswith("http://"):
             sev = Severity.MEDIUM
         if is_ota:
             sev = max(sev, Severity.MEDIUM)
-        findings.append(Finding(sev, "network-ioc", f"URL: {u}", path=""))
+        findings.append(Finding(sev, "network-ioc", f"URL: {u}",
+                                detail=note, path=at))
 
     cloud = sorted(d for d in domains
                    if any(h in d for h in _CLOUD_HINTS + _P2P_HINTS))
     for d in cloud:
         sev = Severity.LOW if any(h in d for h in _P2P_HINTS) else Severity.INFO
+        at, note = loc("domain", d)
         findings.append(Finding(sev, "network-ioc",
-                                f"cloud/P2P service domain: {d}"))
-    iocs = {"urls": sorted(urls), "ips": sorted(ips),
-            "domains": sorted(domains), "cloud_domains": cloud,
-            "macs": sorted(macs)}
+                                f"cloud/P2P service domain: {d}",
+                                detail=note, path=at))
+
+    locations = {kind: {v: [s.to_dict() for s in sites[(k, v)]]
+                        for (k, v) in sites if k == kind}
+                 for kind in ("url", "ip", "domain", "mac")}
+    iocs = {"urls": urls, "ips": ips,
+            "domains": domains, "cloud_domains": cloud,
+            "macs": macs, "locations": locations,
+            "occurrences": {f"{k}:{v}": n for (k, v), n in counts.items()}}
     return findings, iocs
 
 
@@ -721,6 +974,7 @@ class RootfsReport:
     components: list[cvedb.Component] = field(default_factory=list)
     cves: list[cvedb.CveHit] = field(default_factory=list)
     iocs: dict = field(default_factory=dict)
+    netcalls: list = field(default_factory=list)  # netmod.NetBinary
     stats: dict = field(default_factory=dict)
     certs: list = field(default_factory=list)            # certmod.CertInfo
     key_fps: list = field(default_factory=list)          # private-key sha256s
@@ -728,6 +982,8 @@ class RootfsReport:
     busybox: object | None = None                        # bbmod.BusyBoxInfo
     fs_audit: object | None = None                       # fsmod.FsAudit
     boot: list = field(default_factory=list)             # boot/uImage info dicts
+    secrets: list = field(default_factory=list)          # SecretHit (dumpable)
+    interesting: list = field(default_factory=list)      # intmod.InterestingBinary
 
 
 def analyze_rootfs(rootfs: str, *, do_iocs: bool = True,
@@ -743,11 +999,23 @@ def analyze_rootfs(rootfs: str, *, do_iocs: bool = True,
     rep.findings += f
     rep.recovered_creds = recovered
 
-    rep.findings += analyze_secrets(rootfs)
+    f, secs = analyze_secrets(rootfs)
+    rep.findings += f
+    rep.secrets = secs
 
     f, audits = analyze_binaries(rootfs)
     rep.findings += f
     rep.elf_audits = audits
+
+    # which binaries actually touch the network, and where in them
+    f, nets = netmod.analyze(rootfs, audits)
+    rep.findings += f
+    rep.netcalls = nets
+
+    # point out the unusual / vendor / stand-out binaries worth manual RE
+    f, interesting = intmod.analyze(rootfs, audits)
+    rep.findings += f
+    rep.interesting = interesting
 
     rep.findings += analyze_attack_surface(rootfs)
 

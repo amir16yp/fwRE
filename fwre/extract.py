@@ -233,6 +233,47 @@ def _carve_slice(image: str, offset: int, dest_bin: str,
             dst.write(buf)
 
 
+def _try_builtin_squashfs(image: str, out_dir: str, recurse: bool,
+                          max_depth: int, sevenz: str) -> "ExtractResult | None":
+    """Extract SquashFS partition(s) with the pure-Python reader (perm-preserving).
+    Returns an ExtractResult if a rootfs was recovered, else None to fall back."""
+    from . import squashfs as sqfs
+    if not sqfs.available():
+        return None
+    offsets = _scan_fs_offsets(image)
+    sq_offsets = [(o, k) for o, k in offsets if k.startswith("squashfs")]
+    if not sq_offsets:
+        return None
+    res = ExtractResult(image=image, out_dir=out_dir, ok=False)
+    res.detected_fs = sorted({k for _, k in offsets})
+    best = None
+    for idx, (off, _kind) in enumerate(sq_offsets):
+        if not sqfs.can_handle(image, off):
+            continue
+        sub = os.path.join(out_dir, f"_sqfs_{idx:02d}_0x{off:x}")
+        ok, root, log = sqfs.extract(image, off, sub)
+        res.log += f"\n[squashfs @0x{off:x}] ok={ok}\n{log[-400:]}"
+        if not ok:
+            continue
+        res.tools_used.append("dissect.squashfs")
+        if recurse and max_depth > 0:
+            _recurse_nested(sevenz, sub, res, max_depth)
+        rootfs = _find_rootfs(sub)
+        if rootfs:
+            # prefer the richest rootfs (a full linux tree over an app partition)
+            score = sum(os.path.isdir(os.path.join(rootfs, m))
+                        for m in ("etc", "bin", "sbin", "lib", "usr"))
+            if best is None or score > best[0]:
+                best = (score, rootfs)
+            if score >= 4:  # clearly the main rootfs; stop early
+                break
+    if best:
+        res.rootfs = best[1]
+        res.ok = True
+        return res
+    return None
+
+
 def extract(image: str, out_dir: str, *, recurse: bool = True,
             max_depth: int = 3, sevenz: str | None = None,
             carve_fallback: bool = True) -> ExtractResult:
@@ -247,6 +288,15 @@ def extract(image: str, out_dir: str, *, recurse: bool = True,
     """
     sevenz = sevenz or find_7z()
     os.makedirs(out_dir, exist_ok=True)
+
+    # Prefer the built-in SquashFS reader when available: unlike 7z on Windows
+    # it preserves Unix mode bits / ownership / symlinks (written to a sidecar
+    # manifest), which the permission audit depends on. Falls through to 7z for
+    # non-SquashFS images or when the reader isn't installed.
+    if carve_fallback:
+        builtin = _try_builtin_squashfs(image, out_dir, recurse, max_depth, sevenz)
+        if builtin is not None and builtin.rootfs:
+            return builtin
 
     ok, log = _run_7z(sevenz, image, out_dir)
     res = ExtractResult(image=image, out_dir=out_dir, ok=ok, log=log)

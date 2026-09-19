@@ -138,6 +138,55 @@ def is_elf(path: str) -> bool:
         return False
 
 
+def load_segments(data: bytes) -> list[tuple[int, int, int]]:
+    """PT_LOAD segments of an in-memory ELF as (vaddr, file_offset, filesz).
+
+    Used to turn a file offset (where `strings` found something) back into the
+    virtual address a disassembler would show. Empty list if not a usable ELF.
+    """
+    if len(data) < 64 or data[:4] != b"\x7fELF":
+        return []
+    try:
+        is64 = data[4] == 2
+        en = ">" if data[5] == 2 else "<"
+        e_phoff, e_phentsize, e_phnum = _phdr_meta(data, en, is64)
+        out = []
+        for i in range(e_phnum):
+            off = e_phoff + i * e_phentsize
+            if off + e_phentsize > len(data):
+                break
+            if struct.unpack_from(en + "I", data, off)[0] != PT_LOAD:
+                continue
+            if is64:
+                p_offset, p_vaddr = struct.unpack_from(en + "QQ", data, off + 8)
+                p_filesz = struct.unpack_from(en + "Q", data, off + 32)[0]
+            else:
+                p_offset, p_vaddr = struct.unpack_from(en + "II", data, off + 4)
+                p_filesz = struct.unpack_from(en + "I", data, off + 16)[0]
+            out.append((p_vaddr, p_offset, p_filesz))
+        return out
+    except Exception:  # malformed program headers are not worth a traceback
+        return []
+
+
+def vaddr_for_offset(segments: list[tuple[int, int, int]],
+                     file_off: int) -> int | None:
+    """Map a file offset to a virtual address via load_segments() output."""
+    for vaddr, off, filesz in segments:
+        if off <= file_off < off + filesz:
+            return vaddr + (file_off - off)
+    return None
+
+
+def offset_for_vaddr(segments: list[tuple[int, int, int]],
+                     vaddr: int) -> int | None:
+    """Map a virtual address to a file offset via load_segments() output."""
+    for va, off, filesz in segments:
+        if va <= vaddr < va + filesz:
+            return off + (vaddr - va)
+    return None
+
+
 def parse(path: str, max_read: int = 64 * 1024 * 1024) -> ElfInfo:
     info = ElfInfo(path=path)
     try:

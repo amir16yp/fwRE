@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from .finding import Finding, Severity
 
 
-_SENSITIVE_NAMES = ("shadow", "passwd", "gshadow", ".htpasswd")
+# files that MUST stay owner-only (passwd is world-readable by design, excluded)
+_SENSITIVE_NAMES = ("shadow", "gshadow", ".htpasswd", "wpa_supplicant.conf")
 _KEY_SUFFIXES = (".key", ".pem", "_key", "id_rsa", "id_dsa", "id_ecdsa")
 _INIT_HINTS = ("init.d", "rc.local", "rcs", "inittab", "profile", "/etc/rc")
 
@@ -67,7 +68,74 @@ def _modes_reliable(rootfs: str) -> bool:
     return seen_total > 0 and seen_real >= max(3, seen_total // 20)
 
 
+def _analyze_manifest(rootfs: str, manifest: dict) -> tuple[list[Finding], FsAudit]:
+    """Permission audit driven by the fwre extraction manifest (real Unix modes,
+    reliable on every host — this is the path taken after a SquashFS extraction)."""
+    findings: list[Finding] = []
+    a = FsAudit()
+    a.modes_available = True
+    for rel, rec in manifest.items():
+        mode = rec.get("mode", 0)
+        low = rel.lower()
+        if stat.S_ISLNK(mode):
+            continue
+        perm = mode & 0o777
+        is_dir = stat.S_ISDIR(mode)
+
+        if is_dir:
+            if (mode & stat.S_IWOTH) and not (mode & stat.S_ISVTX):
+                a.world_writable.append(rel)
+                findings.append(Finding(
+                    Severity.MEDIUM, "fs-perms",
+                    f"world-writable directory (no sticky bit): {rel}",
+                    "any process can plant/replace files here", rel))
+            continue
+
+        if mode & stat.S_ISUID:
+            a.suid.append(rel)
+            findings.append(Finding(
+                Severity.HIGH, "fs-perms",
+                f"SUID file: {rel} (owner uid {rec.get('uid', '?')})",
+                "runs with owner (often root) privileges", rel))
+        if (mode & stat.S_ISGID) and (mode & stat.S_IXGRP):
+            a.sgid.append(rel)
+            findings.append(Finding(
+                Severity.MEDIUM, "fs-perms", f"SGID file: {rel}", path=rel))
+
+        if mode & stat.S_IWOTH:
+            a.world_writable.append(rel)
+            if any(h in low for h in _INIT_HINTS):
+                a.writable_init.append(rel)
+                findings.append(Finding(
+                    Severity.HIGH, "fs-perms",
+                    f"world-writable boot/init script: {rel}",
+                    "tamper the boot chain for persistence", rel))
+            else:
+                sev = Severity.HIGH if (mode & stat.S_IXUSR) else Severity.MEDIUM
+                findings.append(Finding(
+                    sev, "fs-perms", f"world-writable file: {rel}", path=rel))
+
+        if (any(os.path.basename(low) == s for s in _SENSITIVE_NAMES)
+                or any(low.endswith(k) for k in _KEY_SUFFIXES)):
+            if perm & 0o077:
+                a.loose_keys.append(rel)
+                findings.append(Finding(
+                    Severity.MEDIUM, "fs-perms",
+                    f"secret/key file group/other-accessible: {rel} ({perm:o})",
+                    "credential material not restricted to owner", rel))
+    return findings, a
+
+
 def analyze(rootfs: str) -> tuple[list[Finding], FsAudit]:
+    # prefer the perm-preserving manifest written by the SquashFS extractor
+    try:
+        from . import squashfs as sqfs
+        manifest = sqfs.load_manifest(rootfs)
+    except Exception:
+        manifest = None
+    if manifest:
+        return _analyze_manifest(rootfs, manifest)
+
     findings: list[Finding] = []
     a = FsAudit()
     a.modes_available = _modes_reliable(rootfs)

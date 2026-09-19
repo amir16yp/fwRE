@@ -25,6 +25,23 @@ def strings(data: bytes, min_len: int = 4, utf16: bool = True) -> list[str]:
     return out
 
 
+def strings_with_offsets(data: bytes, min_len: int = 4, utf16: bool = True
+                         ) -> list[tuple[int, str, int]]:
+    """Like strings() but each entry is (file_offset, text, bytes_per_char).
+
+    bytes_per_char is 1 for ASCII and 2 for UTF-16LE, so the offset of a match
+    at character index i inside `text` is  file_offset + i * bytes_per_char.
+    """
+    out: list[tuple[int, str, int]] = []
+    for m in _ascii_re(min_len).finditer(data):
+        out.append((m.start(), m.group().decode("latin1"), 1))
+    if utf16:
+        for m in _utf16_re(min_len).finditer(data):
+            out.append((m.start(), m.group().decode("utf-16-le", "replace"), 2))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
 def strings_file(path: str, min_len: int = 4, max_read: int = 64 * 1024 * 1024,
                  utf16: bool = True) -> list[str]:
     try:

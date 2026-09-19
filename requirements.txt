@@ -1,9 +1,15 @@
-# fwre core is pure Python stdlib. These are OPTIONAL extractors used only as a
-# fallback for filesystems 7-Zip cannot unpack:
+# fwre core is pure Python stdlib. These are OPTIONAL extractors:
+#
+#   dissect.squashfs -> perm-preserving SquashFS extraction (pure-python). When
+#     installed, fwre extracts SquashFS itself and records real Unix mode bits /
+#     ownership / symlinks in a manifest, so the permission/SUID audit works even
+#     on Windows (where 7-Zip drops modes). Falls back to 7z when absent.
 #   jefferson   -> JFFS2  (provides the `jefferson` CLI)
 #   ubi_reader  -> UBI/UBIFS (provides `ubireader_extract_files`)
-# fwre works without them for the SquashFS/cramfs/ext majority; install these to
-# also handle JFFS2 and UBI/UBIFS images.
+#
+# fwre works without them (7z handles the SquashFS/cramfs/ext majority); install
+# these for perm-aware SquashFS and for JFFS2 / UBI-UBIFS images.
+dissect.squashfs>=1.0
 jefferson>=0.4.7
 ubi_reader>=0.8.16
 
