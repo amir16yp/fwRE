@@ -39,7 +39,20 @@ python -m fwre creds path/to/rootfs --wordlist mypasswords.txt
 
 # per-binary hardening report (checksec)
 python -m fwre checksec rootfs/usr/sbin/httpd rootfs/bin/busybox
+
+# parse a serial boot log (or auto-find a sibling *.bootlog.txt)
+python -m fwre bootlog firmware/hugolog_e5-...-atbm6012bx.bootlog.txt
+
+# analyze the boot chain (U-Boot / uImage / env) on the raw image
+python -m fwre uboot firmware/wyze_cam3-t31x-gc2053-rtl8189ftv-virgin.bin
+
+# emit a CycloneDX SBOM (standalone, or add --sbom out.json to run/analyze)
+python -m fwre sbom path/to/rootfs -o firmware.sbom.json
 ```
+
+`batch` additionally writes a **cross-image correlation** section into
+`SUMMARY.md` — shared `/etc/shadow` hashes, shared TLS certs/keys and reused
+recovered passwords across every image scanned (crack once, own the fleet).
 
 ## How extraction works
 
@@ -80,9 +93,20 @@ subprocess and are **not** bundled — keep them on PATH on the target machine.
 | `elf.py` + `analyze.py` | **checksec**: arch/endian/bits, static/stripped, NX, PIE, RELRO, stack canary, FORTIFY, RPATH; dangerous libc imports; setuid & network-daemon flagging |
 | `services.py` | **service misconfigs**: sshd/dropbear, telnet/inetd, FTP (vsftpd/proftpd/bftpd), nginx, lighttpd, apache, boa/goahead, wpa_supplicant/hostapd, unbound/dnsmasq, samba, mosquitto (MQTT), NTP, SNMP; plus web-app **RCE / XSS / SQLi / LFI** sinks in CGI/Lua/PHP/shell |
 | `analyze.py` (attack surface) | init scripts (`inittab`, `init.d/rcS`), started daemons, direct-shell telnetd, gdbserver/debug shells |
-| `cvedb.py` | component fingerprinting (busybox, dropbear, openssl, kernel, …) + curated high-impact CVE rules (always available, offline) |
+| `cvedb.py` | component fingerprinting (busybox, dropbear, openssl, kernel, U-Boot, mbedTLS, sqlite, expat, curl, …) + curated high-impact CVE rules (always available, offline) |
 | `cvestore.py` | full **cvelistV5 corpus** — download once, SQLite index, version-range matching |
-| `analyze.py` (network IOCs) | URLs, IPs, cloud/MQTT/OTA endpoints (cleartext firmware fetch, phone-home infra) |
+| `analyze.py` (network IOCs) | URLs, IPs, MACs, cloud/MQTT/OTA endpoints — **cleartext-OTA (HIGH)** and **P2P/cloud control** endpoints classified distinctly (phone-home infra) |
+| `analyze.py` (secrets, cont.) | now also scans **inside ELFs/`.so`** via string extraction (keys compiled into cloud/app daemons), adds AWS-secret/Alibaba/Slack/Telegram/Tuya patterns + an **entropy gate** |
+| `analyze.py` (binaries, cont.) | **static-binary** dangerous-func detection (string scan), **RWX segment** + **UPX/packed** flags, `.comment`/toolchain, global hardening rollup |
+| `bootlog.py` | parses serial **`*.bootlog.txt`**: U-Boot/kernel/gcc versions, `mtdparts`, `bootargs` (init=/console=/root=), boot-time creds → feeds CVE matching |
+| `uboot.py` | boot-chain analysis on the **raw image**: U-Boot banner, **uImage** headers, U-Boot **env** (bootargs/bootcmd), init=/bin/sh + no-verified-boot flags |
+| `cloud.py` | **cloud / P2P SDK** fingerprinting (ThroughTek/TUTK-Kalay, Tuya, ajcloud/Gwell, XMeye, iLnkP2P, …) with curated CVEs — the real remote surface on cameras |
+| `certs.py` | pure-stdlib **X.509** parse: weak sig (MD5/SHA1), short RSA, self-signed, expiry, SHA-256 fingerprint; recognises TLS-library **test vectors** and softens them |
+| `fsaudit.py` | filesystem **permission** audit: SUID/SGID, world-writable files/dirs, writable init scripts, loose key perms (auto-skips when Windows extraction drops modes) |
+| `busybox.py` | **BusyBox applet** enumeration + dangerous-applet flagging (telnetd/nc/tftp/wget/crond), symlink-exposure aware |
+| `correlate.py` | **cross-image (fleet)** correlation in `batch`: shared `/etc/shadow` hashes, shared certs/keys, reused cracked passwords across the corpus |
+| `services.py` (cont.) | adds TR-069/CWMP, UPnP/miniupnpd, OpenVPN/stunnel/IPsec keys, RTSP/ONVIF auth, and **compiled-CGI** (C `httpd`) command-injection detection |
+| `sbom.py` | **CycloneDX 1.5** SBOM export (`--sbom`, or `fwre sbom`) from the fingerprinted component/CVE set |
 
 ## CVE corpus
 
@@ -127,15 +151,23 @@ embedded private keys) → `HIGH` → `MEDIUM` → `LOW` → `INFO`. See
 ```
 fwre/
   __main__.py    python -m fwre
-  cli.py         argparse front-end (extract/analyze/run/batch/creds/cvedb/checksec/strings)
+  cli.py         argparse front-end (extract/analyze/run/batch/creds/cvedb/checksec/strings/bootlog/uboot/sbom)
   extract.py     7z driver + magic-locate carve fallback
-  elf.py         pure-python ELF parser + checksec
-  analyze.py     rootfs orchestrator + credential/secret/binary/IOC analyzers
-  services.py    per-service misconfig + web-app sink analyzers
-  defaults.py    default/weak credential recovery
+  elf.py         pure-python ELF parser + checksec (+ .comment, RWX, packed, static dangerous-func scan)
+  analyze.py     rootfs orchestrator + credential/secret/binary/attack-surface/IOC analyzers
+  services.py    per-service misconfig + web-app sink analyzers (+ TR-069/UPnP/VPN/RTSP/compiled-CGI)
+  defaults.py    default/weak credential recovery (+ sudoers / cred-backup files)
   cryptcrack.py  pure-python md5/sha256/sha512 crypt (verified vs test vectors)
   cvedb.py       fingerprints + curated CVE rules
   cvestore.py    cvelistV5 downloader + SQLite index
+  bootlog.py     serial boot-log (*.bootlog.txt) parser
+  uboot.py       raw-image U-Boot / uImage / env analyzer
+  cloud.py       cloud / P2P SDK fingerprinting + CVEs
+  certs.py       stdlib X.509 certificate / private-key analyzer
+  fsaudit.py     filesystem permission / SUID audit
+  busybox.py     BusyBox applet enumeration
+  correlate.py   cross-image (fleet) correlation for batch
+  sbom.py        CycloneDX SBOM export
   cache.py       cache-dir helper
   finding.py     Finding / Severity model
   report.py      markdown + json renderers

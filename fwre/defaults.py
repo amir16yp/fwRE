@@ -34,6 +34,11 @@ DEFAULT_PASSWORDS = [
     "service", "supervisor", "administrator", "wbox123", "fliradmin",
     "tlJwpbo6", "hi3518", "hslwificam", "cat1029", "ivdev", "OxhlwSG8",
     "solokey", "tsgoingon", "smcadmin", "ubnt", "thingino", "openipc",
+    # Ingenic / SigmaStar / Anyka BSP + common camera-ODM defaults
+    "ingenic", "anyka", "t31", "isvp", "sigmastar", "ssc335", "hisilicon",
+    "hi3518", "hi3516", "gk7205", "rockchip", "rv1106", "jz", "cambricon",
+    "camera123", "ipcamera", "888888a", "admin888", "888admin", "iComm",
+    "20080826", "5up", "cxlinux", "gospell", "hichip", "wuuk", "aoqee",
 ]
 
 # publicly documented vendor default root hashes -> (password, note)
@@ -42,6 +47,9 @@ KNOWN_DEFAULT_HASHES = {
     # classic hi35xx / xiongmai / generic camera defaults seen in the wild
     "$1$RYIwEiRA$d5iRRVQ5ZeoTrJDpP4mAT/": ("xmhdipc", "Xiongmai default root"),
     "$1$$qRPK7m23GJusamGpoGLby/": ("(blank)", "empty-password md5crypt"),
+    # NOTE: only add entries here for hashes whose plaintext is *verified*. The
+    # wordlist path below actually cracks (and thus proves) matches, so prefer
+    # extending DEFAULT_PASSWORDS over guessing hash->password pairs here.
 }
 
 # service default credential pairs to look for referenced in configs
@@ -141,7 +149,7 @@ def crack_hashes(rootfs: str, wordlist: list[str] | None = None
             continue
 
         if not cryptcrack.crackable(h):
-            # descrypt / bcrypt / yescrypt — note for offline cracking
+            # descrypt / bcrypt / yescrypt - note for offline cracking
             continue
 
         for w in words:
@@ -254,6 +262,59 @@ def find_hardcoded_creds(rootfs: str) -> tuple[list[Finding], list[RecoveredCred
 
 
 # ---------------------------------------------------------------------------
+# 4: sudoers escalation + passwd/shadow backups
+# ---------------------------------------------------------------------------
+
+def check_sudoers_and_backups(rootfs: str) -> tuple[list[Finding], list[RecoveredCred]]:
+    import glob
+    findings: list[Finding] = []
+    recovered: list[RecoveredCred] = []
+
+    sudoers = []
+    for g in ("etc/sudoers", "etc/sudoers.d/*"):
+        sudoers += glob.glob(os.path.join(rootfs, g.replace("/", os.sep)))
+    for p in sudoers:
+        if not os.path.isfile(p):
+            continue
+        rel = _rel(rootfs, p)
+        for _, line in ((i, ln.strip()) for i, ln in
+                        enumerate(_read(p).splitlines())):
+            if not line or line.startswith("#") or line.startswith("Defaults"):
+                continue
+            if "NOPASSWD" in line:
+                sev = Severity.HIGH if re.search(r"\bALL\b\s*$", line) or "ALL) NOPASSWD: ALL" in line else Severity.MEDIUM
+                findings.append(Finding(
+                    sev, "default-creds",
+                    "passwordless sudo rule (NOPASSWD)", line[:100], rel))
+            elif re.search(r"\)\s*ALL\s*$", line) and not line.startswith("root"):
+                findings.append(Finding(
+                    Severity.MEDIUM, "default-creds",
+                    "sudo grants full command set", line[:100], rel))
+
+    # /etc/passwd- , /etc/shadow- and other backup copies of the cred DBs
+    for g in ("etc/passwd-", "etc/shadow-", "etc/gshadow", "etc/gshadow-",
+              "etc/passwd.bak", "etc/shadow.bak", "etc/*.old"):
+        for p in glob.glob(os.path.join(rootfs, g.replace("/", os.sep))):
+            if not os.path.isfile(p):
+                continue
+            rel = _rel(rootfs, p)
+            text = _read(p)
+            for line in text.splitlines():
+                parts = line.split(":")
+                if len(parts) >= 2 and parts[1] and parts[1] not in ("*", "!", "!!", "x"):
+                    findings.append(Finding(
+                        Severity.MEDIUM, "default-creds",
+                        f"credential backup file with live hashes: {rel}",
+                        f"{parts[0]}:{parts[1][:24]}...", rel))
+                    if parts[1] in KNOWN_DEFAULT_HASHES:
+                        pw, note = KNOWN_DEFAULT_HASHES[parts[1]]
+                        recovered.append(RecoveredCred(parts[0], pw, rel,
+                                                       "known-hash", note=note))
+                    break
+    return findings, recovered
+
+
+# ---------------------------------------------------------------------------
 # orchestrator
 # ---------------------------------------------------------------------------
 
@@ -266,6 +327,9 @@ def analyze_default_creds(rootfs: str, wordlist: list[str] | None = None
     findings += f
     recovered += r
     f, r = find_hardcoded_creds(rootfs)
+    findings += f
+    recovered += r
+    f, r = check_sudoers_and_backups(rootfs)
     findings += f
     recovered += r
     return findings, recovered

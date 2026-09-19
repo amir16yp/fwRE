@@ -1,11 +1,11 @@
-"""Firmware extraction — 7-Zip driver with carve fallback and external
+"""Firmware extraction - 7-Zip driver with carve fallback and external
 extractors for the filesystems 7z can't read.
 
 The raw .bin flash dumps carry a bootloader, one or more uImage kernels and a
 root filesystem. 7z locates and unpacks SquashFS/cramfs/ext/gzip regardless of
 offset; when it grabs the wrong (earlier) archive we locate filesystem magics
 and hand 7z a carved [offset:EOF] slice per candidate. For JFFS2 and UBI/UBIFS
-— which 7z cannot unpack — we shell out to `jefferson` and
+- which 7z cannot unpack - we shell out to `jefferson` and
 `ubireader_extract_files` respectively (optional; install via requirements.txt).
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 # Filesystem/container magics we may need to point 7z at when it latches onto
 # the wrong (earlier) archive in a multi-partition flash dump. We only *locate*
-# these — 7z still does the actual unpacking on the carved [offset:EOF] slice.
+# these - 7z still does the actual unpacking on the carved [offset:EOF] slice.
 _FS_MAGICS = [
     (b"hsqs", "squashfs"), (b"sqsh", "squashfs-be"),
     (b"sqlz", "squashfs-lzma"), (b"qshs", "squashfs"),
@@ -191,7 +191,7 @@ def _nested_archives(root: str) -> list[str]:
 def _scan_fs_offsets(image: str, max_scan: int = 256 * 1024 * 1024) -> list[tuple[int, str]]:
     """Locate filesystem magics in the raw image (offset, kind), best-first.
 
-    This does NOT validate — it just finds candidate offsets so we can hand a
+    This does NOT validate - it just finds candidate offsets so we can hand a
     carved [offset:EOF] slice to 7z when the first archive it sees isn't the
     root filesystem. SquashFS/UBI/cramfs/ext are prioritised over gzip.
     """

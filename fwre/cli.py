@@ -20,6 +20,8 @@ from . import extract as extractor
 from . import analyze as analyzer
 from . import report as reporter
 from . import elf as elfmod
+from . import correlate as correlator
+from . import sbom as sbommod
 from .strings_util import strings_file
 from .finding import sort_findings
 
@@ -33,7 +35,7 @@ def cmd_extract(args):
     res = extractor.extract(args.image, args.out or _default_out(args.image),
                             recurse=not args.no_recurse)
     print(f"[+] extracted to {res.out_dir}")
-    print(f"[+] rootfs: {res.rootfs or '(not found — check output tree)'}")
+    print(f"[+] rootfs: {res.rootfs or '(not found - check output tree)'}")
     if not res.ok:
         print("[!] 7z reported errors (often just device nodes on Windows)")
     return 0
@@ -62,7 +64,8 @@ def cmd_run(args):
             print(f"    hint: {res.hint}", file=sys.stderr)
         return 2
     print(f"[*] analyzing {res.rootfs}")
-    rep = analyzer.analyze_rootfs(res.rootfs, do_iocs=not args.no_iocs)
+    rep = analyzer.analyze_rootfs(res.rootfs, do_iocs=not args.no_iocs,
+                                  image_path=args.image)
     _emit(rep, args, image=os.path.basename(args.image))
     return 0
 
@@ -75,6 +78,7 @@ def cmd_batch(args):
     out_root = args.out or "fwre_out"
     os.makedirs(out_root, exist_ok=True)
     rows = []
+    corr_records = []
     for img in images:
         name = os.path.splitext(os.path.basename(img))[0]
         print(f"[*] {name}")
@@ -87,9 +91,11 @@ def cmd_batch(args):
         if not res.rootfs:
             fs = ", ".join(res.detected_fs) if res.detected_fs else "unknown"
             print(f"    [!] no 7z-extractable rootfs (fs: {fs})"
-                  + (f" — {res.hint}" if res.hint else ""))
+                  + (f" - {res.hint}" if res.hint else ""))
             continue
-        rep = analyzer.analyze_rootfs(res.rootfs, do_iocs=not args.no_iocs)
+        rep = analyzer.analyze_rootfs(res.rootfs, do_iocs=not args.no_iocs,
+                                      image_path=img)
+        corr_records.append(correlator.record(name, rep))
         # write per-image reports
         with open(os.path.join(out_root, name + ".md"), "w", encoding="utf-8") as fh:
             fh.write(reporter.to_markdown(rep, image=name))
@@ -110,9 +116,14 @@ def cmd_batch(args):
         print(f"    crit={rep.stats.get('critical',0)} high={rep.stats.get('high',0)} "
               f"elfs={rep.stats.get('elf_count',0)} cve={len(rep.cves)}")
     summary = reporter.batch_summary_markdown(rows)
+    correlation = correlator.build_report(corr_records)
     with open(os.path.join(out_root, "SUMMARY.md"), "w", encoding="utf-8") as fh:
         fh.write(summary)
+        if correlation:
+            fh.write(correlation)
     print("\n" + summary)
+    if correlation:
+        print(correlation)
     print(f"[+] reports written to {out_root}/")
     return 0
 
@@ -194,6 +205,59 @@ def cmd_strings(args):
     return 0
 
 
+def cmd_bootlog(args):
+    from . import bootlog as blmod
+    targets = []
+    if os.path.isfile(args.target) and args.target.lower().endswith(".txt"):
+        targets = [args.target]
+    else:
+        targets = blmod.find_bootlogs(args.target)
+    if not targets:
+        print(f"[!] no *.bootlog.txt found for {args.target}", file=sys.stderr)
+        return 2
+    for t in targets:
+        findings, info = blmod.analyze(t)
+        print(f"[*] {os.path.basename(t)}")
+        print(f"    U-Boot={info.uboot or '?'}  kernel={info.kernel or '?'}"
+              f"  gcc={info.gcc or '?'}")
+        if info.mtdparts:
+            print(f"    mtdparts={info.mtdparts}")
+        if info.bootargs:
+            print(f"    bootargs={info.bootargs}")
+        for f in sort_findings(findings):
+            print("    " + f.line())
+    return 0
+
+
+def cmd_uboot(args):
+    from . import uboot as ubmod
+    findings, info = ubmod.analyze(args.image)
+    print(f"[*] {os.path.basename(args.image)}")
+    print(f"    U-Boot={info.uboot or '?'}  uImages={len(info.uimages)}")
+    for k, v in info.env.items():
+        print(f"    env {k}={v[:120]}")
+    for f in sort_findings(findings):
+        print("    " + f.line())
+    return 0
+
+
+def cmd_sbom(args):
+    rootfs = _resolve_rootfs(args.rootfs)
+    if not rootfs:
+        print(f"[!] no rootfs found under {args.rootfs}", file=sys.stderr)
+        return 2
+    rep = analyzer.analyze_rootfs(rootfs, do_iocs=False)
+    doc = sbommod.to_cyclonedx(rep.components, rep.cves,
+                               image=os.path.basename(args.rootfs.rstrip("/\\")))
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(doc)
+        print(f"[+] CycloneDX SBOM written to {args.output}")
+    else:
+        print(doc)
+    return 0
+
+
 # --- helpers ---------------------------------------------------------------
 
 def _default_out(image: str) -> str:
@@ -216,6 +280,11 @@ def _expand_images(target: str) -> list[str]:
 
 
 def _emit(rep, args, image=""):
+    if getattr(args, "sbom", None):
+        doc = sbommod.to_cyclonedx(rep.components, rep.cves, image=image)
+        with open(args.sbom, "w", encoding="utf-8") as fh:
+            fh.write(doc)
+        print(f"[+] CycloneDX SBOM written to {args.sbom}")
     if args.json:
         out = reporter.to_json(rep, image=image)
     else:
@@ -248,6 +317,8 @@ def build_parser() -> argparse.ArgumentParser:
     common_an.add_argument("-o", "--output", help="write report to file")
     common_an.add_argument("--no-iocs", action="store_true",
                            help="skip network-IOC scan (faster)")
+    common_an.add_argument("--sbom", metavar="PATH",
+                           help="also write a CycloneDX SBOM to PATH")
     common_ex = argparse.ArgumentParser(add_help=False)
     common_ex.add_argument("--no-recurse", action="store_true",
                            help="don't recurse into nested archives")
@@ -298,6 +369,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("file")
     s.add_argument("--min", type=int, default=4)
     s.set_defaults(func=cmd_strings)
+
+    bl = sub.add_parser("bootlog", help="parse serial boot logs (*.bootlog.txt)")
+    bl.add_argument("target", help="a .bootlog.txt file, an image, or a directory")
+    bl.set_defaults(func=cmd_bootlog)
+
+    ub = sub.add_parser("uboot", help="analyze U-Boot / uImage in a raw image")
+    ub.add_argument("image")
+    ub.set_defaults(func=cmd_uboot)
+
+    sb = sub.add_parser("sbom", help="emit a CycloneDX SBOM for a rootfs")
+    sb.add_argument("rootfs")
+    sb.add_argument("-o", "--output", help="write SBOM to file (else stdout)")
+    sb.set_defaults(func=cmd_sbom)
     return p
 
 

@@ -50,16 +50,42 @@ _FINGERPRINTS: dict[str, list[re.Pattern]] = {
     "uclibc": [re.compile(r"uClibc(?:-ng)?[ -](?P<ver>\d+\.\d+\.\d+)")],
     "glibc": [re.compile(r"GNU C Library.*?version (?P<ver>\d+\.\d+)")],
     "openssh": [re.compile(r"OpenSSH_(?P<ver>\d+\.\d+)")],
+    "uboot": [re.compile(r"U-Boot(?:\s+SPL)?\s+(?P<ver>\d{4}\.\d{2})")],
+    "mbedtls": [re.compile(r"[Mm]bed ?TLS (?P<ver>\d+\.\d+\.\d+)"),
+                re.compile(r"PolarSSL (?P<ver>\d+\.\d+\.\d+)")],
+    "wolfssl": [re.compile(r"wolfSSL (?P<ver>\d+\.\d+\.\d+)"),
+                re.compile(r"CyaSSL (?P<ver>\d+\.\d+\.\d+)")],
+    "sqlite": [re.compile(r"(?:SQLite|sqlite3?) (?P<ver>3\.\d+\.\d+)")],
+    "expat": [re.compile(r"expat_(?P<ver>\d+\.\d+\.\d+)"),
+              re.compile(r"libexpat.*?(?P<ver>\d+\.\d+\.\d+)")],
+    "libpng": [re.compile(r"libpng version (?P<ver>\d+\.\d+\.\d+)")],
+    "libjpeg": [re.compile(r"libjpeg-turbo version (?P<ver>\d+\.\d+\.\d+)"),
+                re.compile(r"jpeg-(?P<ver>\d+[a-z]?) ")],
+    "ffmpeg": [re.compile(r"(?:ffmpeg|libav\w+) version (?P<ver>\d+\.\d+)")],
+    "live555": [re.compile(r"LIVE555.*?(?P<ver>\d{4}\.\d{2}\.\d{2})")],
+    "lua": [re.compile(r"Lua (?P<ver>5\.\d+\.\d+)")],
+    "json-c": [re.compile(r"json-c[/ ](?P<ver>\d+\.\d+)")],
+    "pppd": [re.compile(r"pppd version (?P<ver>\d+\.\d+\.\d+)")],
+    "ntp": [re.compile(r"ntpd (?P<ver>\d+\.\d+\.\d+)"),
+            re.compile(r"ntpd? .*?(?P<ver>4\.\d+\.\d+)")],
+    "mosquitto": [re.compile(r"mosquitto version (?P<ver>\d+\.\d+\.\d+)")],
 }
 
 
 def _v(s: str) -> tuple:
-    """Loose version tuple for comparison; non-numeric tails ignored."""
+    """Loose version tuple for comparison. A trailing letter on a component is
+    kept as an extra ordinal (openssl 1.0.1g -> (1,0,1,7)) so lettered branches
+    like Heartbleed compare correctly; other non-numeric tails are ignored."""
     parts = re.split(r"[.\-_]", s)
     out = []
     for p in parts:
-        m = re.match(r"(\d+)", p)
-        out.append(int(m.group(1)) if m else 0)
+        m = re.match(r"(\d+)([a-zA-Z]?)", p)
+        if m:
+            out.append(int(m.group(1)))
+            if m.group(2):
+                out.append(ord(m.group(2).lower()) - 96)  # 'a' -> 1
+        else:
+            out.append(0)
     return tuple(out)
 
 
@@ -78,9 +104,9 @@ _RULES = [
      "MEDIUM", "autocomplete escape-injection in busybox <1.27.0"),
     ("busybox", lambda v: v < (1, 33, 2), "CVE-2021-42374/85/86",
      "HIGH", "multiple awk/unlzma OOB + use-after-free in busybox <1.33.2"),
-    ("openssl", lambda v: v < (1, 0, 1) or ((1, 0, 1) <= v < (1, 0, 1)),
+    ("openssl", lambda v: (1, 0, 1) <= v < (1, 0, 1, 8),
      "CVE-2014-0160", "CRITICAL",
-     "Heartbleed possible if 1.0.1..1.0.1g — verify exact build"),
+     "Heartbleed - OpenSSL 1.0.1..1.0.1g are vulnerable"),
     ("openssl", lambda v: (1, 0, 0) <= v < (1, 0, 2), "CVE-2016-2107",
      "HIGH", "padding-oracle / many issues in OpenSSL 1.0.x branch"),
     ("openssl", lambda v: (1, 1, 0) <= v < (1, 1, 1), "CVE-2019-1543",
@@ -101,6 +127,32 @@ _RULES = [
      "MEDIUM", "zlib memory corruption in deflate <1.2.12"),
     ("wpa_supplicant", lambda v: v < (2, 7), "CVE-2017-13077",
      "HIGH", "KRACK key-reinstallation attacks in wpa_supplicant <2.7"),
+    ("hostapd", lambda v: v < (2, 7), "CVE-2017-13082",
+     "HIGH", "KRACK against the AP/FT handshake in hostapd <2.7"),
+    # --- boot chain -------------------------------------------------------
+    ("uboot", lambda v: v < (2014, 4), "U-Boot-EOL",
+     "MEDIUM", "very old U-Boot (<2014.04) - known env/verified-boot weaknesses; "
+     "e.g. CVE-2019-13103/6 (fs) class on unpatched trees"),
+    ("uboot", lambda v: (2014, 4) <= v < (2020, 1), "U-Boot-old",
+     "LOW", "aging U-Boot; review CVE-2019-1368x (NFS/ext4/DOS) applicability"),
+    # --- kernel -----------------------------------------------------------
+    ("kernel", lambda v: (3, 10) <= v < (3, 11), "EOL-kernel-3.10",
+     "HIGH", "kernel 3.10.x is long EOL (Ingenic isvp BSP) - DirtyCOW "
+     "(CVE-2016-5195) and many later fixes are missing"),
+    ("kernel", lambda v: (4, 4) <= v < (5, 9), "CVE-2022-0847",
+     "HIGH", "Dirty Pipe (CVE-2022-0847) affects 5.8+; verify patch level"),
+    # --- libraries --------------------------------------------------------
+    ("libcurl", lambda v: v < (7, 87, 0), "curl-old",
+     "MEDIUM", "libcurl <7.87 - multiple CVEs (e.g. CVE-2023-38545 SOCKS5 "
+     "heap overflow lands <8.4); confirm exact version"),
+    ("sqlite", lambda v: v < (3, 32, 0), "CVE-2020-11655",
+     "MEDIUM", "SQLite <3.32 - several memory-safety CVEs (e.g. CVE-2020-11655/56)"),
+    ("mbedtls", lambda v: v < (2, 16, 9), "mbedtls-old",
+     "MEDIUM", "mbedTLS <2.16.9 - Lucky13/side-channel & parsing CVEs"),
+    ("expat", lambda v: v < (2, 2, 10), "CVE-2022-25236",
+     "HIGH", "libexpat <2.2.10 - XML parsing memory-corruption CVEs"),
+    ("dnsmasq", lambda v: v < (2, 90), "CVE-2023-50387",
+     "MEDIUM", "dnsmasq <2.90 - DNSSEC 'KeyTrap' CPU-exhaustion exposure"),
 ]
 
 

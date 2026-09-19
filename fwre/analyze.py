@@ -16,6 +16,12 @@ from . import elf as elfmod
 from . import cvedb
 from . import services as svcmod
 from . import defaults as defmod
+from . import fsaudit as fsmod
+from . import certs as certmod
+from . import busybox as bbmod
+from . import cloud as cloudmod
+from . import bootlog as bootlogmod
+from . import uboot as ubootmod
 from .strings_util import strings_file
 
 # ---------------------------------------------------------------------------
@@ -134,7 +140,7 @@ def analyze_credentials(rootfs: str) -> tuple[list[Finding], list[Credential]]:
         note = ""
         if h in ("", ) or (pw == "" and (not shadow or h == "")):
             weak = True
-            note = "EMPTY PASSWORD — login with no credentials"
+            note = "EMPTY PASSWORD - login with no credentials"
             findings.append(Finding(
                 Severity.CRITICAL, "credentials",
                 f"account '{user}' has an empty password",
@@ -147,14 +153,14 @@ def analyze_credentials(rootfs: str) -> tuple[list[Finding], list[Credential]]:
                            uid=uid, shell=shell)
             if ht == "descrypt":
                 c.weak = True
-                c.note = "DES crypt — trivially crackable"
+                c.note = "DES crypt - trivially crackable"
                 findings.append(Finding(
                     Severity.HIGH, "credentials",
                     f"account '{user}' uses weak DES password hash",
                     detail=f"hash={h}  (hashcat -m 1500)", path="etc/shadow"))
             elif ht == "md5crypt":
                 c.weak = True
-                c.note = "md5crypt — weak, crack with hashcat -m 500"
+                c.note = "md5crypt - weak, crack with hashcat -m 500"
                 findings.append(Finding(
                     Severity.MEDIUM, "credentials",
                     f"account '{user}' uses weak md5crypt hash",
@@ -204,14 +210,50 @@ _SECRET_PATTERNS = [
      Severity.MEDIUM, "hardcoded credential assignment"),
     (re.compile(r"(?i)\bpsk\s*[:=]\s*['\"]?([0-9A-Fa-f]{8,64})"),
      Severity.HIGH, "Wi-Fi PSK"),
+    (re.compile(r"\baws_secret_access_key\b\s*[:=]\s*['\"]?([A-Za-z0-9/+]{40})"),
+     Severity.CRITICAL, "AWS secret access key"),
+    (re.compile(r"\bLTAI[0-9A-Za-z]{12,22}\b"),
+     Severity.HIGH, "Alibaba Cloud AccessKey ID"),
+    (re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,48}\b"),
+     Severity.HIGH, "Slack token"),
+    (re.compile(r"\b\d{8,10}:[A-Za-z0-9_\-]{35}\b"),
+     Severity.MEDIUM, "Telegram bot token"),
+    (re.compile(r"\bsk_live_[0-9A-Za-z]{24,}\b"),
+     Severity.HIGH, "Stripe live secret key"),
+    (re.compile(r"\bAC[0-9a-fA-F]{32}\b"),
+     Severity.MEDIUM, "Twilio Account SID"),
+    (re.compile(r"(?i)\b(?:tuya|device)[_-]?secret\b\s*[:=]\s*['\"]?([0-9a-f]{16,64})"),
+     Severity.HIGH, "Tuya/device secret"),
+    (re.compile(r"\bghs_[0-9A-Za-z]{36}\b"),
+     Severity.HIGH, "GitHub server-to-server token"),
 ]
+
+# generic high-entropy secret-assignment (checked with an entropy gate)
+_ENTROPY_ASSIGN = re.compile(
+    r"(?i)\b(?:secret|token|apikey|api_key|auth[_-]?key|access[_-]?key|"
+    r"app[_-]?secret|private[_-]?key|client[_-]?secret)\b\s*[:=]\s*"
+    r"['\"]?([A-Za-z0-9/+_\-]{20,64})")
 
 _KEY_FILE_EXT = {".key", ".pem"}
 
 
+def _shannon(s: str) -> float:
+    import math
+    if not s:
+        return 0.0
+    counts: dict[str, int] = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+_SECRET_ELF_MAX = 32 * 1024 * 1024
+
+
 def analyze_secrets(rootfs: str) -> list[Finding]:
     findings: list[Finding] = []
-    seen_msgs: set[tuple[str, str]] = set()
+    seen_msgs: set[tuple[str, str, str]] = set()
     for path in _walk_files(rootfs):
         rel = _rel(rootfs, path)
         ext = os.path.splitext(path)[1].lower()
@@ -220,31 +262,63 @@ def analyze_secrets(rootfs: str) -> list[Finding]:
             findings.append(Finding(
                 Severity.HIGH, "secrets", f"key/cert file present: {rel}",
                 path=rel))
-        # only scan reasonably small text-ish files for secret patterns
         try:
-            if os.path.getsize(path) > _MAX_TEXT:
-                continue
+            size = os.path.getsize(path)
         except OSError:
             continue
-        if elfmod.is_elf(path) or not _is_probably_text(path):
-            continue
-        text = _read_text(path)
+        # Binaries carry the highest-value secrets on cameras (keys compiled into
+        # the app/cloud daemons), so scan ELFs/libraries via their string table
+        # rather than skipping them the way the text path used to.
+        is_binary = elfmod.is_elf(path) or not _is_probably_text(path)
+        if is_binary:
+            if size > _SECRET_ELF_MAX:
+                continue
+            if size < 40 or not (elfmod.is_elf(path)
+                                 or ext in (".so", ".bin", ".ko")
+                                 or ".so." in os.path.basename(rel)):
+                continue
+            text = "\n".join(strings_file(path, min_len=6,
+                                          max_read=_SECRET_ELF_MAX))
+        else:
+            if size > _MAX_TEXT:
+                continue
+            text = _read_text(path)
+
+        lib_vec = is_binary and certmod._is_crypto_lib(rel)
         for pat, sev, desc in _SECRET_PATTERNS:
-            m = pat.search(text)
-            if m:
-                # skip format-string / placeholder false positives
+            # a crypto library's own compiled-in test keys/certs are public and
+            # usually unused - don't raise them as embedded firmware secrets
+            if lib_vec and ("private key" in desc or "certificate" in desc):
+                continue
+            for m in pat.finditer(text):
                 val = m.group(m.lastindex) if m.lastindex else m.group(0)
-                if val and ("%" in val or val in ("...", "xxx", "yyy")):
+                if val and ("%" in val or val in ("...", "xxx", "yyy", "xxxx")):
                     continue
-                key = (rel, desc)
-                if key in seen_msgs:
-                    continue
-                seen_msgs.add(key)
                 snippet = m.group(0)
                 if len(snippet) > 80:
                     snippet = snippet[:77] + "..."
-                findings.append(Finding(
-                    sev, "secrets", desc, detail=snippet, path=rel))
+                key = (rel, desc, snippet)
+                if key in seen_msgs:
+                    continue
+                seen_msgs.add(key)
+                findings.append(Finding(sev, "secrets", desc,
+                                        detail=snippet, path=rel))
+
+        # entropy-gated generic secret assignments (cuts placeholder noise)
+        for m in _ENTROPY_ASSIGN.finditer(text):
+            val = m.group(1)
+            if "%" in val or val.upper() in ("PASSWORD", "SECRET", "CHANGEME"):
+                continue
+            if _shannon(val) < 3.5:
+                continue
+            key = (rel, "high-entropy secret", val[:24])
+            if key in seen_msgs:
+                continue
+            seen_msgs.add(key)
+            findings.append(Finding(
+                Severity.MEDIUM, "secrets",
+                "high-entropy secret assignment",
+                detail=(m.group(0)[:80]), path=rel))
     return findings
 
 
@@ -286,6 +360,19 @@ def analyze_binaries(rootfs: str, deep: bool = True
         audits.append(audit)
 
         # findings ---------------------------------------------------------
+        if info.packed:
+            findings.append(Finding(
+                Severity.MEDIUM, "elf-hardening",
+                f"packed binary ({info.packed}): {rel}",
+                "unpack before static analysis; obfuscation is unusual on stock FW",
+                rel))
+        if info.rwx:
+            findings.append(Finding(
+                Severity.MEDIUM, "elf-hardening",
+                f"writable+executable segment (RWX) in {rel}",
+                "self-modifying / JIT-style mapping weakens exploit mitigations",
+                rel))
+
         if audit.setuid:
             sev = Severity.HIGH if not info.canary or not info.nx else Severity.MEDIUM
             findings.append(Finding(
@@ -308,13 +395,16 @@ def analyze_binaries(rootfs: str, deep: bool = True
                     sev, "elf-hardening",
                     f"network daemon '{base}' poorly hardened",
                     detail=f"{', '.join(weak)}  |  {info.summary()}", path=rel))
+            # dangerous libc usage: dynamic symbols if present, else fall back to
+            # a string scan so statically-linked daemons (busybox/httpd) still hit
             dfns = info.dangerous()
+            if not dfns and info.static:
+                dfns = elfmod.scan_dangerous_strings(path)
             if dfns:
                 findings.append(Finding(
-                    Severity.MEDIUM if audit.network_facing else Severity.LOW,
-                    "dangerous-funcs",
-                    f"'{base}' imports risky libc funcs",
-                    detail=", ".join(dfns), path=rel))
+                    Severity.MEDIUM, "dangerous-funcs",
+                    f"'{base}' uses risky libc funcs",
+                    detail=", ".join(dfns[:20]), path=rel))
 
         if info.rpath or info.runpath:
             rp = info.rpath or info.runpath
@@ -323,6 +413,18 @@ def analyze_binaries(rootfs: str, deep: bool = True
                     Severity.MEDIUM, "elf-hardening",
                     f"insecure RPATH/RUNPATH in {rel}",
                     detail=rp, path=rel))
+
+    # global hardening rollup ---------------------------------------------
+    if audits:
+        n = len(audits)
+        no_nx = sum(1 for a in audits if not a.info.nx)
+        no_pie = sum(1 for a in audits if not a.info.pie)
+        no_can = sum(1 for a in audits if not a.info.canary)
+        findings.append(Finding(
+            Severity.INFO, "elf-hardening",
+            f"hardening rollup: {n} ELFs - no-NX {no_nx}, no-PIE {no_pie}, "
+            f"no-canary {no_can}",
+            "baseline mitigation coverage across the image"))
     return findings, audits
 
 
@@ -335,7 +437,7 @@ _INIT_CANDIDATES = [
     "etc/rc.d/rcS", "linuxrc", "init", "etc/profile",
 ]
 _DAEMON_RISK = {
-    "telnetd": (Severity.HIGH, "telnet daemon — cleartext, often no auth"),
+    "telnetd": (Severity.HIGH, "telnet daemon - cleartext, often no auth"),
     "utelnetd": (Severity.HIGH, "telnet daemon (util) started"),
     "tcpsvd": (Severity.MEDIUM, "tcpsvd super-server may expose telnet/ftp"),
     "getty": (Severity.LOW, "serial console getty (physical access)"),
@@ -343,7 +445,7 @@ _DAEMON_RISK = {
     "sshd": (Severity.INFO, "SSH server started"),
     "ftpd": (Severity.MEDIUM, "FTP daemon started"),
     "tftpd": (Severity.MEDIUM, "TFTP daemon started"),
-    "httpd": (Severity.LOW, "HTTP server started — web attack surface"),
+    "httpd": (Severity.LOW, "HTTP server started - web attack surface"),
     "lighttpd": (Severity.LOW, "lighttpd web server started"),
     "boa": (Severity.MEDIUM, "boa web server (legacy) started"),
     "goahead": (Severity.MEDIUM, "GoAhead web server started"),
@@ -360,12 +462,21 @@ def analyze_attack_surface(rootfs: str) -> list[Finding]:
         p = os.path.join(rootfs, rc.replace("/", os.sep))
         if os.path.isfile(p):
             scripts.append(p)
-    initd = os.path.join(rootfs, "etc", "init.d")
-    if os.path.isdir(initd):
-        for f in os.listdir(initd):
-            fp = os.path.join(initd, f)
-            if os.path.isfile(fp):
-                scripts.append(fp)
+    for sub in ("etc/init.d", "etc/rc.d", "etc/rc.d/init.d",
+                "etc/cron.d", "etc/crontab.d", "etc/systemd/system",
+                "lib/systemd/system", "etc/systemd/system/multi-user.target.wants"):
+        d = os.path.join(rootfs, sub.replace("/", os.sep))
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                fp = os.path.join(d, f)
+                if os.path.isfile(fp):
+                    scripts.append(fp)
+    # cron tables (files, not dirs)
+    for rc in ("etc/crontab", "var/spool/cron/crontabs/root",
+               "var/spool/cron/root", "etc/cron.d/root"):
+        p = os.path.join(rootfs, rc.replace("/", os.sep))
+        if os.path.isfile(p):
+            scripts.append(p)
 
     joined_paths = set(scripts)
     for sp in joined_paths:
@@ -385,8 +496,27 @@ def analyze_attack_surface(rootfs: str) -> list[Finding]:
         if "telnetd" in low and "-l" in low and "login" not in low:
             findings.append(Finding(
                 Severity.CRITICAL, "attack-surface",
-                "telnetd started with a direct shell (-l /bin/sh) — unauth root",
+                "telnetd started with a direct shell (-l /bin/sh) - unauth root",
                 path=rel))
+        # reverse-shell / backdoor idioms
+        if re.search(r"\bnc\b[^\n]*\s-e\s", low) or \
+                re.search(r"mkfifo[^\n]*(?:/bin/sh|/bin/ash|bash -i)", low) or \
+                re.search(r"bash\s+-i\s*>&?\s*/dev/tcp/", low):
+            findings.append(Finding(
+                Severity.HIGH, "attack-surface",
+                "reverse-shell idiom in boot/cron script", detail=rel, path=rel))
+        # OTA over cleartext then execute -> supply-chain RCE
+        if re.search(r"(?:wget|curl)\s+[^\n|;]*http://", low) and \
+                re.search(r"(?:chmod\s+\+?x|/bin/sh|\|\s*sh|\bsh\s+/tmp|\.\s*/tmp)", low):
+            findings.append(Finding(
+                Severity.HIGH, "attack-surface",
+                "downloads over cleartext HTTP then executes (supply-chain RCE)",
+                detail=rel, path=rel))
+        # firewall being flushed/disabled at boot
+        if re.search(r"iptables\s+-F\b", low) or "stop_firewall" in low:
+            findings.append(Finding(
+                Severity.LOW, "attack-surface",
+                "firewall flushed/disabled during boot", detail=rel, path=rel))
 
     # presence of daemon binaries even if not obviously started
     for base, (sev, msg) in _DAEMON_RISK.items():
@@ -496,6 +626,11 @@ def _corpus_cves(comps) -> list[Finding]:
 _URL_RE = re.compile(r"\b(?:https?|ftp|mqtt|rtsp|tcp)://[^\s'\"<>\\)]{4,120}")
 _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b")
 _DOMAIN_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|cn|cloud|tv|co|xyz|aws|me|info)\b", re.I)
+_MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b")
+_P2P_HINTS = ("tutk", "kalay", "ppcs", "iotcplatform", "ppstrun", "throughtek",
+              "gwell", "ajcloud", "meari", "xmeye", "vstarcam", "ilnk", "pppp",
+              "tuya", "aliyuncs", "iotc")
+_OTA_HINTS = ("ota", "update", "firmware", "upgrade", "/fw/", "download")
 
 _CLOUD_HINTS = ("amazonaws", "aliyun", "aliyuncs", "tuya", "tutk", "iotcplatform",
                 "ipcam", "ppstrun", "ppcs", "kalay", "gwell", "ajcloud",
@@ -506,6 +641,7 @@ def analyze_network_iocs(rootfs: str) -> tuple[list[Finding], dict]:
     urls: set[str] = set()
     ips: set[str] = set()
     domains: set[str] = set()
+    macs: set[str] = set()
     for path in _walk_files(rootfs):
         rel = _rel(rootfs, path)
         try:
@@ -529,21 +665,45 @@ def analyze_network_iocs(rootfs: str) -> tuple[list[Finding], dict]:
                 ips.add(ip)
         for m in _DOMAIN_RE.finditer(text):
             domains.add(m.group(0).lower())
+        for m in _MAC_RE.finditer(text):
+            mac = m.group(0).lower()
+            if mac not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+                macs.add(mac)
 
     findings: list[Finding] = []
     for u in sorted(urls):
+        ul = u.lower()
         sev = Severity.LOW
+        is_ota = any(h in ul for h in _OTA_HINTS)
+        is_p2p = any(h in ul for h in _P2P_HINTS)
+        if u.startswith("http://") and is_ota:
+            # cleartext firmware/update fetch = classic supply-chain vector
+            findings.append(Finding(
+                Severity.HIGH, "network-ioc",
+                f"cleartext OTA/update endpoint: {u}",
+                "unauthenticated HTTP firmware fetch - MITM to implant", path=""))
+            continue
+        if is_p2p:
+            findings.append(Finding(
+                Severity.MEDIUM, "network-ioc",
+                f"P2P/cloud control endpoint: {u}",
+                "device phone-home / remote-access infrastructure", path=""))
+            continue
         if u.startswith("http://"):
-            sev = Severity.MEDIUM  # cleartext firmware/config fetch
-        if any(h in u.lower() for h in ("ota", "update", "firmware")):
+            sev = Severity.MEDIUM
+        if is_ota:
             sev = max(sev, Severity.MEDIUM)
         findings.append(Finding(sev, "network-ioc", f"URL: {u}", path=""))
-    cloud = sorted(d for d in domains if any(h in d for h in _CLOUD_HINTS))
+
+    cloud = sorted(d for d in domains
+                   if any(h in d for h in _CLOUD_HINTS + _P2P_HINTS))
     for d in cloud:
-        findings.append(Finding(Severity.INFO, "network-ioc",
-                                f"cloud/service domain: {d}"))
+        sev = Severity.LOW if any(h in d for h in _P2P_HINTS) else Severity.INFO
+        findings.append(Finding(sev, "network-ioc",
+                                f"cloud/P2P service domain: {d}"))
     iocs = {"urls": sorted(urls), "ips": sorted(ips),
-            "domains": sorted(domains), "cloud_domains": cloud}
+            "domains": sorted(domains), "cloud_domains": cloud,
+            "macs": sorted(macs)}
     return findings, iocs
 
 
@@ -562,10 +722,17 @@ class RootfsReport:
     cves: list[cvedb.CveHit] = field(default_factory=list)
     iocs: dict = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
+    certs: list = field(default_factory=list)            # certmod.CertInfo
+    key_fps: list = field(default_factory=list)          # private-key sha256s
+    cloud: list = field(default_factory=list)            # cloudmod.CloudSDK
+    busybox: object | None = None                        # bbmod.BusyBoxInfo
+    fs_audit: object | None = None                       # fsmod.FsAudit
+    boot: list = field(default_factory=list)             # boot/uImage info dicts
 
 
 def analyze_rootfs(rootfs: str, *, do_iocs: bool = True,
-                   wordlist: list[str] | None = None) -> RootfsReport:
+                   wordlist: list[str] | None = None,
+                   image_path: str | None = None) -> RootfsReport:
     rep = RootfsReport(rootfs=rootfs)
 
     f, creds = analyze_credentials(rootfs)
@@ -586,10 +753,49 @@ def analyze_rootfs(rootfs: str, *, do_iocs: bool = True,
 
     rep.findings += svcmod.analyze_services(rootfs)
 
+    # filesystem permission audit
+    f, fsa = fsmod.analyze(rootfs)
+    rep.findings += f
+    rep.fs_audit = fsa
+
+    # certificates & private keys
+    f, certs_, keys_ = certmod.analyze(rootfs)
+    rep.findings += f
+    rep.certs = certs_
+    # exclude TLS-library test keys from the fleet-correlation fingerprints
+    rep.key_fps = [k.sha256 for k in keys_
+                   if k.sha256 and not certmod._is_crypto_lib(k.source)]
+
+    # busybox applet surface
+    f, bb = bbmod.analyze(rootfs)
+    rep.findings += f
+    rep.busybox = bb
+
+    # cloud / P2P SDK fingerprint
+    f, sdks = cloudmod.analyze(rootfs)
+    rep.findings += f
+    rep.cloud = sdks
+
     f, comps, cves = analyze_versions(rootfs)
     rep.findings += f
     rep.components = comps
     rep.cves = cves
+
+    # boot chain: uImage/U-Boot from the raw image + sibling serial boot logs
+    if image_path and os.path.isfile(image_path):
+        try:
+            bf, binfo = ubootmod.analyze(image_path)
+            rep.findings += bf
+            rep.boot.append({"kind": "uboot", **binfo.__dict__})
+        except Exception:
+            pass
+        for blog in bootlogmod.find_bootlogs(image_path):
+            try:
+                lf, li = bootlogmod.analyze(blog)
+                rep.findings += lf
+                rep.boot.append({"kind": "bootlog", **li.__dict__})
+            except Exception:
+                pass
 
     if do_iocs:
         f, iocs = analyze_network_iocs(rootfs)

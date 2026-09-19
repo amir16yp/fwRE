@@ -76,7 +76,7 @@ def download(url: str = CVE_ZIP_URL, dest: str | None = None,
                 mb = got / 1e6
                 tot = f"/{total/1e6:.0f}" if total else ""
                 rate = mb / max(time.time() - t0, 0.01)
-                sys.stderr.write(f"\r    downloading… {mb:.0f}{tot} MB "
+                sys.stderr.write(f"\r    downloading... {mb:.0f}{tot} MB "
                                  f"({rate:.1f} MB/s)")
                 sys.stderr.flush()
     if progress:
@@ -151,7 +151,7 @@ def build_index(zip_file: str | None = None, progress: bool = True) -> int:
     Returns the number of affected-rows inserted."""
     zip_file = zip_file or zip_path()
     if not os.path.isfile(zip_file):
-        raise FileNotFoundError(f"{zip_file} not present — download first")
+        raise FileNotFoundError(f"{zip_file} not present - download first")
 
     dbp = db_path()
     tmp_db = dbp + ".building"
@@ -186,7 +186,7 @@ def build_index(zip_file: str | None = None, progress: bool = True) -> int:
                 batch.clear()
             if progress and files % 5000 == 0:
                 sys.stderr.write(
-                    f"\r    indexing… {files} records, {rows} rows "
+                    f"\r    indexing... {files} records, {rows} rows "
                     f"({files/max(time.time()-t0,0.01):.0f} rec/s)")
                 sys.stderr.flush()
     if batch:

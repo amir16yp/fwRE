@@ -35,6 +35,7 @@ DF_1_PIE = 0x08000000
 PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_GNU_STACK, PT_GNU_RELRO = 1, 2, 3, 0x6474e551, 0x6474e552
 ET_DYN = 3
 PF_X = 0x1
+PF_W = 0x2
 
 # libc symbols that are classic memory-safety / command-injection footguns
 DANGEROUS_FUNCS = {
@@ -67,6 +68,9 @@ class ElfInfo:
     fortify: bool = False
     rpath: str = ""
     runpath: str = ""
+    comment: str = ""        # .comment section (toolchain / gcc banner)
+    rwx: bool = False        # a PT_LOAD segment is both writable and executable
+    packed: str = ""         # "" or a packer name (e.g. "UPX")
     dyn_symbols: list[str] = field(default_factory=list)
     needed: list[str] = field(default_factory=list)
     error: str = ""
@@ -91,7 +95,39 @@ class ElfInfo:
             m.append(f"RPATH={self.rpath}")
         if self.runpath:
             m.append(f"RUNPATH={self.runpath}")
+        if self.rwx:
+            m.append("RWX-seg")
+        if self.packed:
+            m.append(f"PACKED:{self.packed}")
         return " ".join(m)
+
+
+def scan_dangerous_strings(path: str, max_read: int = 16 * 1024 * 1024) -> list[str]:
+    """For statically-linked / stripped binaries there are no dynamic symbols to
+    inspect, so fall back to matching dangerous libc names in the string table.
+    Coarser than symbol analysis (a name may appear in an unrelated string) but
+    recovers signal on the BusyBox/uClibc static blobs that dominate these images.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(max_read)
+    except OSError:
+        return []
+    out = []
+    for fn in sorted(DANGEROUS_FUNCS):
+        needle = fn.encode()
+        i = data.find(needle)
+        if i < 0:
+            continue
+        # require a NUL/non-identifier boundary so "system" doesn't match "systemd"
+        before = data[i - 1:i]
+        after = data[i + len(needle):i + len(needle) + 1]
+        if before and (before.isalnum() or before == b"_"):
+            continue
+        if after and (after.isalnum() or after == b"_"):
+            continue
+        out.append(fn)
+    return out
 
 
 def is_elf(path: str) -> bool:
@@ -113,6 +149,8 @@ def parse(path: str, max_read: int = 64 * 1024 * 1024) -> ElfInfo:
     if data[:4] != b"\x7fELF":
         return info
     info.is_elf = True
+    if b"UPX!" in data[:256] or b"UPX!" in data[-4096:]:
+        info.packed = "UPX"
     try:
         _parse(data, info)
     except Exception as e:  # never let a malformed binary crash a scan
@@ -155,6 +193,9 @@ def _parse(d: bytes, info: ElfInfo) -> None:
             p_type = struct.unpack_from(en + "I", d, off)[0]
             p_offset, p_vaddr = struct.unpack_from(en + "II", d, off + 4)
             p_flags = struct.unpack_from(en + "I", d, off + 24)[0]
+        if p_type == PT_LOAD:
+            if (p_flags & PF_X) and (p_flags & PF_W):
+                info.rwx = True
         if p_type == PT_GNU_STACK:
             gnu_stack_x = bool(p_flags & PF_X)
         elif p_type == PT_GNU_RELRO:
@@ -194,6 +235,12 @@ def _parse(d: bytes, info: ElfInfo) -> None:
                  _al, s_ent) = struct.unpack_from(en + "IIIIIIIIII", d, off)
             nm = _cstr(d, shstr_off + name) if shstr_off else ""
             sections.append((nm, stype, s_off, s_sz, s_link, s_ent))
+            if nm == ".comment" and s_off and s_sz and s_off + s_sz <= len(d):
+                raw = d[s_off:s_off + min(s_sz, 512)]
+                parts = [p.decode("latin1", "replace")
+                         for p in raw.split(b"\x00") if p.strip()]
+                if parts:
+                    info.comment = "; ".join(dict.fromkeys(parts))[:200]
 
     secnames = {s[0] for s in sections}
     # SHT_SYMTAB == 2 present and not empty => not stripped

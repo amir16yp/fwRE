@@ -28,6 +28,11 @@ def to_json(rep: RootfsReport, image: str = "") -> str:
             for a in rep.elf_audits
         ],
         "iocs": rep.iocs,
+        "certs": [c.__dict__ for c in rep.certs],
+        "cloud_sdks": [c.__dict__ for c in rep.cloud],
+        "busybox": rep.busybox.__dict__ if rep.busybox else None,
+        "boot": rep.boot,
+        "key_fingerprints": rep.key_fps,
     }
     return json.dumps(obj, indent=2)
 
@@ -53,13 +58,13 @@ def to_markdown(rep: RootfsReport, image: str = "") -> str:
         if f.severity != cur:
             cur = f.severity
             ap(f"\n### {f.severity.label}\n")
-        loc = f" — `{f.path}`" if f.path else ""
+        loc = f" - `{f.path}`" if f.path else ""
         det = f"  \n  {f.detail}" if f.detail else ""
         ap(f"- **{f.category}**: {f.title}{loc}{det}")
     if not fs:
         ap("_No findings._")
 
-    # recovered / default credentials — highest value, show first
+    # recovered / default credentials - highest value, show first
     if rep.recovered_creds:
         ap("\n## ⚠ Recovered / default credentials\n")
         ap("| user | password | source | method |")
@@ -112,6 +117,59 @@ def to_markdown(rep: RootfsReport, image: str = "") -> str:
             ap(f"| `{a.path}` | {i.machine} | {i.kind} | {yn(i.nx)} | "
                f"{yn(i.pie)} | {i.relro} | {yn(i.canary)} | "
                f"{yn(i.stripped)} | {yn(a.setuid)} | {yn(a.network_facing)} |")
+
+    # boot chain (uImage / U-Boot / serial boot logs)
+    if rep.boot:
+        ap("\n## Boot chain\n")
+        for b in rep.boot:
+            if b.get("kind") == "uboot":
+                ap(f"- **U-Boot**: {b.get('uboot') or '(version n/a)'}")
+                for u in b.get("uimages", [])[:8]:
+                    ap(f"  - uImage `{u.get('name','')}` "
+                       f"{u.get('os','')}/{u.get('arch','')} {u.get('comp','')} "
+                       f"load {u.get('load','')}")
+                env = b.get("env", {})
+                if env.get("bootargs"):
+                    ap(f"  - bootargs: `{env['bootargs'][:160]}`")
+            elif b.get("kind") == "bootlog":
+                ap(f"- **boot log** `{b.get('source','')}`: "
+                   f"U-Boot {b.get('uboot') or '?'}, kernel {b.get('kernel') or '?'}")
+                if b.get("mtdparts"):
+                    ap(f"  - mtdparts: `{b['mtdparts'][:160]}`")
+                if b.get("bootargs"):
+                    ap(f"  - bootargs: `{b['bootargs'][:160]}`")
+
+    # cloud / P2P SDKs
+    if rep.cloud:
+        ap("\n## Cloud / P2P SDKs\n")
+        for c in rep.cloud:
+            ap(f"- **{c.name}** ({c.vendor}) - `{c.source}` (marker `{c.evidence}`)")
+
+    # certificates
+    if rep.certs:
+        ap("\n## Embedded certificates\n")
+        ap("| source | key | sig | valid until | self-signed | sha256 |")
+        ap("|---|---|---|---|---|---|")
+        for c in rep.certs:
+            key = f"{c.key_type}{('/'+str(c.key_bits)) if c.key_bits else ''}"
+            ap(f"| `{c.source}` | {key or '?'} | {c.sig_algo or '?'} | "
+               f"{c.not_after or '?'}{' (EXPIRED)' if c.expired else ''} | "
+               f"{'yes' if c.self_signed else 'no'} | `{c.sha256[:16]}` |")
+
+    # busybox applets
+    if rep.busybox and rep.busybox.dangerous:
+        ap("\n## BusyBox applet surface\n")
+        ap(f"- version: **{rep.busybox.version or '?'}**")
+        ap(f"- notable applets: {', '.join(rep.busybox.dangerous)}")
+
+    # fs permission summary
+    if rep.fs_audit:
+        a = rep.fs_audit
+        if a.suid or a.world_writable or a.writable_init:
+            ap("\n## Filesystem permissions\n")
+            ap(f"- SUID files: {len(a.suid)}  |  world-writable: "
+               f"{len(a.world_writable)}  |  writable init scripts: "
+               f"{len(a.writable_init)}")
 
     # IOCs
     if rep.iocs:

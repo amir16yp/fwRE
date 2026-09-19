@@ -124,7 +124,7 @@ def check_dropbear(rootfs: str) -> list[Finding]:
             if base.endswith(("_key", ".key")) or "host" in base:
                 f.append(Finding(Severity.HIGH, "svc-ssh",
                                  f"shared SSH host/private key in firmware: {rel}",
-                                 "identical key across all devices — MITM/impersonation",
+                                 "identical key across all devices - MITM/impersonation",
                                  rel))
     return f
 
@@ -163,7 +163,7 @@ def check_telnet_inetd(rootfs: str) -> list[Finding]:
         for _, line in _uncommented(text):
             if "telnetd" in line and re.search(r"-l\s+/bin/(?:sh|ash)", line):
                 f.append(Finding(Severity.CRITICAL, "svc-telnet",
-                                 "telnetd -l /bin/sh — direct root shell, no auth",
+                                 "telnetd -l /bin/sh - direct root shell, no auth",
                                  line[:120], rel))
     return f
 
@@ -233,7 +233,7 @@ def check_nginx(rootfs: str) -> list[Finding]:
         # classic alias traversal / off-by-slash
         if re.search(r"location\s+/\w+\s*\{[^}]*\balias\b", low, re.S):
             f.append(Finding(Severity.MEDIUM, "svc-web",
-                             "nginx location+alias — check off-by-slash path traversal",
+                             "nginx location+alias - check off-by-slash path traversal",
                              path=rel))
         # SSRF-prone proxy_pass with variable
         if re.search(r"proxy_pass\s+https?://\$", low):
@@ -266,11 +266,11 @@ def check_lighttpd(rootfs: str) -> list[Finding]:
                              "lighttpd dir-listing enabled", path=rel))
         if "mod_cgi" in low or "cgi.assign" in low:
             f.append(Finding(Severity.LOW, "svc-web",
-                             "lighttpd mod_cgi enabled — audit CGI handlers for RCE",
+                             "lighttpd mod_cgi enabled - audit CGI handlers for RCE",
                              path=rel))
-        if 'server.username' not in low or re.search(r'server\.username\s*=\s*"root"', low):
+        if re.search(r'server\.username\s*=\s*"root"', low):
             f.append(Finding(Severity.MEDIUM, "svc-web",
-                             "lighttpd likely running as root (no privilege drop)",
+                             "lighttpd configured to run as root (server.username root)",
                              path=rel))
         if "ssl.pemfile" in low and "ssl.engine" in low:
             pass
@@ -299,7 +299,7 @@ def check_apache(rootfs: str) -> list[Finding]:
                              path=rel))
         if re.search(r"<limitexcept\b", low) is None and "require all granted" in low:
             f.append(Finding(Severity.LOW, "svc-web",
-                             "apache 'Require all granted' — verify scope", path=rel))
+                             "apache 'Require all granted' - verify scope", path=rel))
         if "traceenable on" in low or "traceenable" not in low:
             f.append(Finding(Severity.LOW, "svc-web",
                              "apache TraceEnable not disabled (XST)", path=rel))
@@ -322,7 +322,7 @@ def check_boa_goahead(rootfs: str) -> list[Finding]:
                              "boa running as root", path=rel))
     if _find_files(rootfs, "**/goahead", "usr/sbin/goahead", "bin/goahead"):
         f.append(Finding(Severity.MEDIUM, "svc-web",
-                         "GoAhead web server present — audit CGI (CVE-2017-17562 RCE)",
+                         "GoAhead web server present - audit CGI (CVE-2017-17562 RCE)",
                          path="goahead"))
     return f
 
@@ -381,7 +381,7 @@ def check_dns(rootfs: str) -> list[Finding]:
         low = _read(p).lower()
         if re.search(r'access-control:\s*0\.0\.0\.0/0\s+allow', low):
             f.append(Finding(Severity.HIGH, "svc-dns",
-                             "unbound open resolver (access-control allows 0.0.0.0/0) — DDoS amp",
+                             "unbound open resolver (access-control allows 0.0.0.0/0) - DDoS amp",
                              path=rel))
         if "interface: 0.0.0.0" in low and "access-control" not in low:
             f.append(Finding(Severity.MEDIUM, "svc-dns",
@@ -400,7 +400,7 @@ def check_dns(rootfs: str) -> list[Finding]:
                              path=rel))
         if "dhcp-boot" in low or "enable-tftp" in low:
             f.append(Finding(Severity.LOW, "svc-dns",
-                             "dnsmasq TFTP/PXE enabled — extra attack surface", path=rel))
+                             "dnsmasq TFTP/PXE enabled - extra attack surface", path=rel))
     return f
 
 
@@ -453,7 +453,7 @@ def check_misc_services(rootfs: str) -> list[Finding]:
 
 
 # ---------------------------------------------------------------------------
-# Web-app source: CGI / Lua / PHP / shell — RCE & XSS sinks
+# Web-app source: CGI / Lua / PHP / shell - RCE & XSS sinks
 # ---------------------------------------------------------------------------
 
 # command-execution sinks fed by request data
@@ -517,7 +517,7 @@ def check_webapp_sinks(rootfs: str) -> list[Finding]:
                             seen.add(key)
                             f.append(Finding(Severity.HIGH, "webapp-rce",
                                              f"command/eval sink {label} with request-data source",
-                                             "possible command injection — trace tainted input",
+                                             "possible command injection - trace tainted input",
                                              rel))
                     elif in_webish:
                         key = (rel, "rce-weak", label)
@@ -553,6 +553,150 @@ def check_webapp_sinks(rootfs: str) -> list[Finding]:
 
 
 # ---------------------------------------------------------------------------
+# TR-069 / CWMP remote management
+# ---------------------------------------------------------------------------
+
+def check_tr069(rootfs: str) -> list[Finding]:
+    f = []
+    for p in _find_files(rootfs, "etc/**/*.conf", "etc/tr069/*", "**/cwmp*.conf",
+                         "**/tr069*.conf", "**/*acs*.conf"):
+        rel = _rel(rootfs, p)
+        low = _read(p).lower()
+        if "cwmp" not in low and "tr069" not in low and "acs" not in low \
+                and "connectionrequest" not in low:
+            continue
+        f.append(Finding(Severity.MEDIUM, "svc-tr069",
+                         "TR-069/CWMP remote-management config present",
+                         "carrier/ODM can push config & firmware - CVE-2014-9222 "
+                         "'Misfortune Cookie' class if RomPager-based", rel))
+        for m in re.finditer(r'(?im)(?:acs|connectionrequest)?(?:username|password)\s*[:=]\s*(\S+)', low):
+            if m.group(1) not in ("", '""', "''"):
+                f.append(Finding(Severity.HIGH, "svc-tr069",
+                                 "hardcoded TR-069 ACS credential", m.group(0)[:80], rel))
+                break
+    return f
+
+
+# ---------------------------------------------------------------------------
+# UPnP / miniupnpd - port mapping / IGD
+# ---------------------------------------------------------------------------
+
+def check_upnp(rootfs: str) -> list[Finding]:
+    f = []
+    for p in _find_files(rootfs, "etc/miniupnpd*.conf", "etc/miniupnpd/*.conf",
+                         "etc/upnpd.conf"):
+        rel = _rel(rootfs, p)
+        low = _read(p).lower()
+        f.append(Finding(Severity.MEDIUM, "svc-upnp",
+                         "miniupnpd/UPnP IGD present - automatic firewall pinholing",
+                         "malware/LAN peers can self-expose ports to the WAN", rel))
+        if "secure_mode=no" in low or ("secure_mode" not in low):
+            f.append(Finding(Severity.MEDIUM, "svc-upnp",
+                             "miniupnpd secure_mode not enabled (map arbitrary hosts)",
+                             path=rel))
+    if _find_files(rootfs, "**/wsdd", "**/wscd", "usr/sbin/*upnp*", "bin/*upnp*"):
+        f.append(Finding(Severity.LOW, "svc-upnp",
+                         "UPnP/WS-Discovery daemon present", path="upnp"))
+    return f
+
+
+# ---------------------------------------------------------------------------
+# VPN / TLS tunnels - embedded keys
+# ---------------------------------------------------------------------------
+
+def check_vpn_tls(rootfs: str) -> list[Finding]:
+    f = []
+    for p in _find_files(rootfs, "etc/openvpn/**/*", "etc/openvpn/*.conf",
+                         "**/*.ovpn"):
+        rel = _rel(rootfs, p)
+        text = _read(p)
+        if "<key>" in text or "BEGIN PRIVATE KEY" in text or "BEGIN RSA PRIVATE" in text:
+            f.append(Finding(Severity.HIGH, "svc-vpn",
+                             "OpenVPN config with an embedded private key", path=rel))
+        if re.search(r'(?im)^\s*auth-user-pass\s+\S+', text):
+            f.append(Finding(Severity.MEDIUM, "svc-vpn",
+                             "OpenVPN auth-user-pass points at a stored cred file",
+                             path=rel))
+    for p in _find_files(rootfs, "etc/stunnel/*.conf", "etc/stunnel.conf"):
+        rel = _rel(rootfs, p)
+        low = _read(p).lower()
+        if "cert" in low or "key" in low:
+            f.append(Finding(Severity.MEDIUM, "svc-vpn",
+                             "stunnel TLS tunnel config present (check embedded key)",
+                             path=rel))
+    for p in _find_files(rootfs, "etc/ipsec.secrets", "etc/ipsec.conf"):
+        rel = _rel(rootfs, p)
+        if _read(p).strip():
+            f.append(Finding(Severity.HIGH, "svc-vpn",
+                             "IPsec secrets/config present (PSK or key material)",
+                             path=rel))
+    return f
+
+
+# ---------------------------------------------------------------------------
+# RTSP / ONVIF - camera media plane
+# ---------------------------------------------------------------------------
+
+def check_rtsp_onvif(rootfs: str) -> list[Finding]:
+    f = []
+    for p in _find_files(rootfs, "etc/**/*.conf", "etc/**/*.cfg", "**/rtsp*.conf",
+                         "**/onvif*.conf", "**/*media*.conf"):
+        rel = _rel(rootfs, p)
+        low = _read(p).lower()
+        if "rtsp" in low:
+            if re.search(r'(?:auth|authentication|need_auth)\s*[:=]\s*(?:0|off|false|no|none)', low):
+                f.append(Finding(Severity.HIGH, "svc-rtsp",
+                                 "RTSP authentication disabled - open video stream",
+                                 path=rel))
+            if re.search(r'rtsp://[^:@\s]+:[^@\s]+@', low):
+                f.append(Finding(Severity.HIGH, "svc-rtsp",
+                                 "hardcoded RTSP credentials in config", path=rel))
+        if "onvif" in low and re.search(r'(?:auth|ws-security|wsse)\s*[:=]\s*(?:0|off|false|no)', low):
+            f.append(Finding(Severity.HIGH, "svc-onvif",
+                             "ONVIF WS-Security/auth disabled", path=rel))
+    return f
+
+
+# ---------------------------------------------------------------------------
+# Compiled CGI (C) - request-data → command sinks in the httpd binary itself
+# ---------------------------------------------------------------------------
+
+def check_cgi_binaries(rootfs: str) -> list[Finding]:
+    from . import elf as elfmod
+    from .strings_util import strings_file
+    f = []
+    import glob
+    cands: set[str] = set()
+    for g in ("www/**/*", "**/cgi-bin/*", "**/webs*", "usr/sbin/httpd",
+              "bin/httpd", "usr/sbin/goahead", "**/*.cgi"):
+        for p in glob.glob(os.path.join(rootfs, g.replace("/", os.sep)),
+                           recursive=True):
+            if os.path.isfile(p):
+                cands.add(p)
+    for p in sorted(cands):
+        if not elfmod.is_elf(p):
+            continue
+        try:
+            if os.path.getsize(p) > 32 * 1024 * 1024:
+                continue
+        except OSError:
+            continue
+        rel = _rel(rootfs, p)
+        blob = "\n".join(strings_file(p, min_len=5, max_read=32 * 1024 * 1024))
+        low = blob.lower()
+        has_src = ("query_string" in low or "content_length" in low
+                   or "request_method" in low)
+        has_sink = bool(re.search(r'\b(system|popen|execve?|exec[lv][ep]?)\b', low))
+        if has_src and has_sink:
+            f.append(Finding(Severity.HIGH, "webapp-rce",
+                             f"compiled CGI '{os.path.basename(rel)}' mixes CGI env "
+                             f"with a shell-exec sink",
+                             "trace QUERY_STRING/CONTENT_* into system()/exec - "
+                             "classic camera httpd command injection", rel))
+    return f
+
+
+# ---------------------------------------------------------------------------
 # aggregate
 # ---------------------------------------------------------------------------
 
@@ -560,6 +704,8 @@ ALL_CHECKS = [
     check_sshd, check_dropbear, check_telnet_inetd, check_ftp,
     check_nginx, check_lighttpd, check_apache, check_boa_goahead,
     check_wifi, check_dns, check_misc_services, check_webapp_sinks,
+    check_tr069, check_upnp, check_vpn_tls, check_rtsp_onvif,
+    check_cgi_binaries,
 ]
 
 
