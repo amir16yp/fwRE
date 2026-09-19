@@ -1,0 +1,11 @@
+# fwre core is pure Python stdlib. These are OPTIONAL extractors used only as a
+# fallback for filesystems 7-Zip cannot unpack:
+#   jefferson   -> JFFS2  (provides the `jefferson` CLI)
+#   ubi_reader  -> UBI/UBIFS (provides `ubireader_extract_files`)
+# fwre works without them for the SquashFS/cramfs/ext majority; install these to
+# also handle JFFS2 and UBI/UBIFS images.
+jefferson>=0.4.7
+ubi_reader>=0.8.16
+
+# Optional: build a standalone binary (see build_nuitka.bat / build_nuitka.sh)
+# nuitka>=2.0
