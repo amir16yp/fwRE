@@ -11,7 +11,6 @@ No third-party crypto: just enough ASN.1 to read the fields we report on.
 """
 from __future__ import annotations
 
-import base64
 import datetime as _dt
 import hashlib
 import os
@@ -19,12 +18,7 @@ import re
 from dataclasses import dataclass, field
 
 from .finding import Finding, Severity
-
-
-_PEM_CERT_RE = re.compile(
-    rb"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", re.S)
-_PEM_KEY_RE = re.compile(
-    rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----", re.S)
+from . import pem as pemmod
 
 _SIG_OIDS = {
     "1.2.840.113549.1.1.4": ("md5WithRSA", True),
@@ -220,24 +214,21 @@ def analyze(rootfs: str):
                 continue
             rel = _rel(rootfs, p)
 
-            km = _PEM_KEY_RE.search(blob)
-            if km:
-                # hash the whole key block so the fleet pass can spot the same
-                # private key shipped across devices
-                block = blob[km.start():km.start() + 8192]
-                keys.append(KeyFile(rel, "PEM private key",
-                                    hashlib.sha256(block).hexdigest()))
+            # Whole-block match only: the bare "-----BEGIN PRIVATE KEY-----"
+            # banner is a string constant in every TLS stack (wpa_supplicant,
+            # mbedTLS, OpenSSL), so a header without a decodable body is a
+            # PEM *parser*, not key material. See fwre/pem.py.
+            pem_keys = pemmod.find_keys(blob)
+            for k in pem_keys:
+                # fingerprint the decoded key body so the fleet pass spots the
+                # same private key shipped across devices even when re-wrapped
+                keys.append(KeyFile(rel, f"PEM private key, {k.kind}", k.sha256))
+            if not pem_keys and pemmod.looks_like_der_key(blob) and \
+                    name.lower().endswith((".key", ".der", ".p8", ".pk8")):
+                keys.append(KeyFile(rel, "DER private key",
+                                    hashlib.sha256(blob).hexdigest()))
 
-            found_der = []
-            for m in _PEM_CERT_RE.finditer(blob):
-                try:
-                    der = base64.b64decode(re.sub(rb"\s+", b"", m.group(1)))
-                except Exception:
-                    continue
-                # a real cert is a DER SEQUENCE of at least a few hundred bytes;
-                # skip empty/garbage bodies (e.g. a PEM banner with no payload)
-                if len(der) >= 64 and der[:1] == b"\x30":
-                    found_der.append(der)
+            found_der = [b.payload for b in pemmod.find_certs(blob)]
             if not found_der and blob[:1] == b"\x30" and len(blob) >= 64 and \
                     name.lower().endswith((".der", ".crt", ".cer")):
                 found_der.append(blob)

@@ -14,6 +14,7 @@ import os
 import re
 
 from .finding import Finding, Severity
+from . import pem as pemmod
 
 
 _MAX = 2 * 1024 * 1024
@@ -33,11 +34,16 @@ def _rel(rootfs: str, p: str) -> str:
 
 def _find_files(rootfs: str, *rel_globs: str) -> list[str]:
     import glob
-    out = []
+    out, seen = [], set()
     for g in rel_globs:
-        out += glob.glob(os.path.join(rootfs, g.replace("/", os.sep)),
-                         recursive=True)
-    return [p for p in out if os.path.isfile(p)]
+        for p in glob.glob(os.path.join(rootfs, g.replace("/", os.sep)),
+                           recursive=True):
+            # overlapping globs ("etc/openvpn/**/*" and "**/*.ovpn") would
+            # otherwise report the same file twice
+            if p not in seen and os.path.isfile(p):
+                seen.add(p)
+                out.append(p)
+    return out
 
 
 def _uncommented(text: str):
@@ -726,7 +732,9 @@ def check_vpn_tls(rootfs: str) -> list[Finding]:
                          "**/*.ovpn"):
         rel = _rel(rootfs, p)
         text = _read(p)
-        if "<key>" in text or "BEGIN PRIVATE KEY" in text or "BEGIN RSA PRIVATE" in text:
+        # a whole PEM block - not just the BEGIN banner, which also shows up
+        # in commented-out sample configs and in the inline <key> template
+        if pemmod.has_key(text):
             f.append(Finding(Severity.HIGH, "svc-vpn",
                              "OpenVPN config with an embedded private key", path=rel))
         if re.search(r'(?im)^\s*auth-user-pass\s+\S+', text):

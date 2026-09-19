@@ -145,7 +145,8 @@ string extraction, for keys baked into cloud/app daemons) for private keys, TLS
 certs, cloud/API tokens (AWS access **and** secret keys, GCP, GitHub, JWT,
 Alibaba, Slack, Telegram, Tuya), Wi-Fi PSKs and hardcoded `SECRET=…`
 assignments. Generic high-entropy candidates pass an entropy gate to cut noise,
-and every hit is reported with its exact location.
+and every hit is reported with its exact location. PEM keys/certs are matched as
+**whole blocks** (see `pem.py`), not by their `-----BEGIN-----` banner.
 
 **`certs.py` — X.509 / private-key analyzer.** A from-scratch stdlib ASN.1/DER
 parser (no third-party crypto) that finds every PEM/DER certificate and key in
@@ -153,7 +154,9 @@ the rootfs and reads just enough to flag what matters for firmware: weak
 signature algorithms (MD5/SHA1), short RSA keys, self-signed device certs, and
 expired / not-yet-valid windows. Each cert is fingerprinted (SHA-256 of the DER)
 for the cross-image pass, and known TLS-library test vectors are recognised and
-softened so they don't drown out real device certs.
+softened so they don't drown out real device certs. Private keys are fingerprinted
+by their decoded body, so the same key is matched across devices however it was
+re-wrapped - and a binary that merely *parses* PEM is not reported as carrying one.
 
 ### Binaries
 
@@ -371,6 +374,7 @@ fwre/
   uboot.py       raw-image U-Boot / uImage / env analyzer
   cloud.py       cloud / P2P SDK fingerprinting + CVEs
   certs.py       stdlib X.509 certificate / private-key analyzer
+  pem.py         whole-block PEM key/cert validation (kills BEGIN-banner false positives)
   fsaudit.py     filesystem permission / SUID audit
   busybox.py     BusyBox applet enumeration
   correlate.py   cross-image (fleet) correlation for batch

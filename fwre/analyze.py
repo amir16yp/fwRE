@@ -26,6 +26,7 @@ from . import bootlog as bootlogmod
 from . import uboot as ubootmod
 from . import interesting as intmod
 from . import netcalls as netmod
+from . import pem as pemmod
 from .strings_util import strings_file, strings, strings_with_offsets
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,14 @@ def _read_text(path: str, limit: int = _MAX_TEXT) -> str:
             return fh.read(limit).decode("latin1", "replace")
     except OSError:
         return ""
+
+
+def _read_bytes(path: str, limit: int = _MAX_TEXT) -> bytes:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(limit)
+    except OSError:
+        return b""
 
 
 def _is_probably_text(path: str) -> bool:
@@ -200,11 +209,10 @@ def analyze_credentials(rootfs: str) -> tuple[list[Finding], list[Credential]]:
 # 2. secrets, keys, certificates
 # ---------------------------------------------------------------------------
 
+# NB: PEM private keys and certificates are *not* in this table - a bare
+# `-----BEGIN ... PRIVATE KEY-----` banner is a string constant in every TLS
+# stack, so they need whole-block validation (see _scan_pem() / fwre/pem.py).
 _SECRET_PATTERNS = [
-    (re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
-     Severity.CRITICAL, "private key material embedded in firmware"),
-    (re.compile(r"-----BEGIN CERTIFICATE-----"),
-     Severity.LOW, "TLS certificate embedded"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
      Severity.HIGH, "AWS access key id"),
     (re.compile(r"\bASIA[0-9A-Z]{16}\b"),
@@ -401,6 +409,67 @@ class SecretHit:
         return self.rel
 
 
+def _pem_blocks(raw: bytes, text: str, is_binary: bool, finder):
+    """Run a fwre.pem finder over one file, returning [(block, offset, line)].
+
+    Text files are scanned as-is. Binaries are scanned over their raw bytes so
+    the reported offset is exact; if that finds nothing we retry over the
+    extracted string table, which reassembles a block that the linker stored as
+    separate NUL-terminated lines."""
+    if not is_binary:
+        return [(b, None, b.line(text)) for b in finder(text.encode("latin1", "replace"))]
+    out = [(b, b.start, None) for b in finder(raw)]
+    if not out:
+        for b in finder(text.encode("latin1", "replace")):
+            off = raw.find(b.block[:64])
+            out.append((b, off if off >= 0 else None, None))
+    return out
+
+
+def _scan_pem(raw: bytes, text: str, is_binary: bool, rel: str, path: str,
+              lib_vec: bool, findings: list, secrets: list) -> None:
+    """Private keys and certificates, matched as complete PEM blocks only.
+
+    The banner alone ("-----BEGIN RSA PRIVATE KEY-----") is a format string in
+    every TLS stack - wpa_supplicant, mbedTLS, OpenSSL and friends all carry
+    the BEGIN/END pair plus `Proc-Type: 4,ENCRYPTED` next to their PEM parser -
+    so it is matched only together with a base64 body that decodes to plausible
+    key material. See fwre/pem.py."""
+    if lib_vec:
+        # a crypto library's own compiled-in test keys/certs are public and
+        # usually unused - don't raise them as embedded firmware secrets
+        return
+
+    for blk, off, line in _pem_blocks(raw, text, is_binary, pemmod.find_keys):
+        loc = (f"{rel} @ 0x{off:x}" if off is not None
+               else (f"{rel}:{line}" if line is not None else rel))
+        sev = Severity.HIGH if blk.encrypted else Severity.CRITICAL
+        note = " (passphrase-protected)" if blk.encrypted else ""
+        findings.append(Finding(
+            sev, "secrets",
+            f"private key material embedded in firmware: {blk.kind}{note}",
+            detail=f"{blk.label}, {len(blk.payload)}-byte body, "
+                   f"sha256={blk.sha256[:16]}", path=loc))
+        secrets.append(SecretHit(
+            desc="private key", rel=rel, abs_path=path, is_binary=is_binary,
+            value=f"{blk.kind}, {len(blk.payload)}-byte body, "
+                  f"sha256={blk.sha256[:16]}",
+            offset=off, line=line, is_pem=True))
+
+    for blk, off, line in _pem_blocks(raw, text, is_binary, pemmod.find_certs):
+        loc = (f"{rel} @ 0x{off:x}" if off is not None
+               else (f"{rel}:{line}" if line is not None else rel))
+        findings.append(Finding(
+            Severity.LOW, "secrets", "TLS certificate embedded",
+            detail=f"{len(blk.payload)}-byte DER, sha256={blk.sha256[:16]}",
+            path=loc))
+        secrets.append(SecretHit(
+            desc="TLS certificate embedded", rel=rel, abs_path=path,
+            is_binary=is_binary,
+            value=f"X.509, {len(blk.payload)}-byte DER, sha256={blk.sha256[:16]}",
+            offset=off, line=line, is_pem=True))
+
+
 def analyze_secrets(rootfs: str) -> tuple[list[Finding], list[SecretHit]]:
     findings: list[Finding] = []
     secrets: list[SecretHit] = []
@@ -408,18 +477,24 @@ def analyze_secrets(rootfs: str) -> tuple[list[Finding], list[SecretHit]]:
     for path in _walk_files(rootfs):
         rel = _rel(rootfs, path)
         ext = os.path.splitext(path)[1].lower()
-        # key/cert files by extension
-        if ext in _KEY_FILE_EXT:
-            findings.append(Finding(
-                Severity.HIGH, "secrets", f"key/cert file present: {rel}",
-                path=rel))
-            secrets.append(SecretHit(
-                desc="key/cert file", value=rel, rel=rel, abs_path=path,
-                is_pem=True))
         try:
             size = os.path.getsize(path)
         except OSError:
             continue
+        # key/cert files by extension - the name alone is only a hint, so check
+        # the content: a .pem holding nothing but a cert is not a key leak, and
+        # an armored key is left to _scan_pem() below, which pins its location
+        if ext in _KEY_FILE_EXT:
+            head = _read_bytes(path, 512 * 1024)
+            if not (pemmod.find_keys(head) and size <= _MAX_TEXT):
+                der_key = pemmod.looks_like_der_key(head)
+                findings.append(Finding(
+                    Severity.HIGH if der_key else Severity.LOW, "secrets",
+                    f"{'DER private key' if der_key else 'key/cert'} "
+                    f"file present: {rel}", path=rel))
+                secrets.append(SecretHit(
+                    desc="private key file" if der_key else "key/cert file",
+                    value=rel, rel=rel, abs_path=path, is_pem=True))
         # Binaries carry the highest-value secrets on cameras (keys compiled into
         # the app/cloud daemons), so scan ELFs/libraries via their string table
         # rather than skipping them the way the text path used to.
@@ -455,11 +530,8 @@ def analyze_secrets(rootfs: str) -> tuple[list[Finding], list[SecretHit]]:
             return f"{rel}:{line}", None, line
 
         lib_vec = is_binary and certmod._is_crypto_lib(rel)
+        _scan_pem(raw, text, is_binary, rel, path, lib_vec, findings, secrets)
         for pat, sev, desc in _SECRET_PATTERNS:
-            # a crypto library's own compiled-in test keys/certs are public and
-            # usually unused - don't raise them as embedded firmware secrets
-            if lib_vec and ("private key" in desc or "certificate" in desc):
-                continue
             # the loose key=value pattern is noisy against binary string tables
             # (matches help text) - keep it to text/config files only
             if is_binary and desc == "hardcoded credential assignment":

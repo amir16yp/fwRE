@@ -390,12 +390,20 @@ def _is_cert(s) -> bool:
     return "certificate" in s.desc.lower()
 
 
+def _is_key(s) -> bool:
+    return "private key" in s.desc.lower() and getattr(s, "is_pem", False)
+
+
 def _secret_filename(outdir: str, s, idx: int) -> str:
     base = s.rel.replace("/", "_").replace("\\", "_")
     tag = f"0x{s.offset:x}" if s.offset is not None else \
         (f"L{s.line}" if s.line is not None else "f")
-    ext = "cert.pem" if _is_cert(s) else "secret"
-    prefix = "cert" if _is_cert(s) else "secret"
+    if _is_cert(s):
+        prefix, ext = "cert", "cert.pem"
+    elif _is_key(s):
+        prefix, ext = "key", "key.pem"
+    else:
+        prefix, ext = "secret", "secret"
     return os.path.join(outdir, f"{prefix}_{idx:03d}_{base}_{tag}.{ext}")
 
 
