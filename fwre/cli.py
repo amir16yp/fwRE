@@ -478,6 +478,8 @@ def _dump_secrets(rep, args, image=""):
 _FAST_HASHES = {"descrypt", "md5crypt"}
 # suggested brute masks for the fast ones (IoT passwords are short)
 _BRUTE_MASK = {"descrypt": "?a?a?a?a?a?a?a?a", "md5crypt": "?a?a?a?a?a?a?a?a"}
+# on Windows the binary is hashcat.exe; elsewhere it's plain hashcat
+_HASHCAT = "hashcat.exe" if os.name == "nt" else "hashcat"
 
 
 def _crack_assist(rep, args, image=""):
@@ -497,7 +499,7 @@ def _crack_assist(rep, args, image=""):
     auto = getattr(args, "crack", False)
     print(f"\n[*] hash crack-assist phase - {len(creds)} hash(es)")
     outdir = os.path.join("fwre_secrets", image or "rootfs")
-    have_hc = shutil.which("hashcat") is not None
+    have_hc = shutil.which(_HASHCAT) is not None
 
     for c in creds:
         mode = c.hashcat_mode.split()[0] if c.hashcat_mode and \
@@ -523,13 +525,17 @@ def _crack_assist(rep, args, image=""):
 
         os.makedirs(outdir, exist_ok=True)
         hashfile = os.path.join(outdir, f"{c.user}.hash")
-        with open(hashfile, "w", encoding="utf-8") as fh:
+        # newline="\n": hashcat needs a bare LF (or none). On Windows the default
+        # text mode would translate "\n" to "\r\n", and the stray CR gets counted
+        # as part of the hash -> "Token length exception" for fixed-length formats
+        # like descrypt (-m 1500).
+        with open(hashfile, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(c.hash + "\n")
 
         if fast:
             mask = _BRUTE_MASK.get(c.hash_type, "?a?a?a?a?a?a?a")
-            cmd = f"hashcat -m {mode} -a 3 {hashfile} {mask} -i"
-            wl_cmd = f"hashcat -m {mode} -a 0 {hashfile} <WORDLIST>"
+            cmd = f"{_HASHCAT} -m {mode} -a 3 {hashfile} {mask} -i"
+            wl_cmd = f"{_HASHCAT} -m {mode} -a 0 {hashfile} <WORDLIST>"
             print(f"    brute:    {cmd}")
             print(f"    wordlist: {wl_cmd}")
             action = "s"
@@ -541,7 +547,7 @@ def _crack_assist(rep, args, image=""):
                     action = "n"
             if action.startswith("r"):
                 if not have_hc:
-                    print("[!] hashcat not on PATH - saving instead")
+                    print(f"[!] {_HASHCAT} not on PATH - saving instead")
                     action = "s"
                 else:
                     print(f"[*] running: {cmd}")
@@ -554,7 +560,7 @@ def _crack_assist(rep, args, image=""):
                 _save_crack_cmd(outdir, c, [cmd, wl_cmd])
         else:
             # strong hash: wordlist only, save (never brute/run)
-            cmd = f"hashcat -m {mode} -a 0 {hashfile} <WORDLIST>"
+            cmd = f"{_HASHCAT} -m {mode} -a 0 {hashfile} <WORDLIST>"
             print(f"    {c.hash_type} is slow - supply a wordlist:")
             print(f"    {cmd}")
             _save_crack_cmd(outdir, c, [cmd])

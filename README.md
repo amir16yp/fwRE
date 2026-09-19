@@ -6,20 +6,24 @@ whose `.bin` flash dumps carry a bootloader, one or more `uImage` kernels and a
 SquashFS/JFFS2/UBI root filesystem.
 
 The **analysis layer** — where the value is — is pure Python stdlib. Extraction
-uses a **built-in, pure-Python SquashFS reader** for the common case (and, being
-in-process, it preserves Unix permissions even on Windows), and shells out to
-7-Zip / jefferson / ubi_reader for the other filesystem types.
+is Python too: a **built-in SquashFS reader** for the common case (in-process, so
+it preserves Unix permissions even on Windows) plus `jefferson` (JFFS2) and
+`ubi_reader` (UBI/UBIFS), which are pip packages driven in-process — so they all
+compile into the standalone binary. Only **7-Zip** stays external (a system tool,
+for cramfs/ext/gzip and nested archives).
 
 ## Requirements
 
 - Python 3.9+
-- Extraction backends (`pip install -r requirements.txt` for the Python ones):
+- Python extraction backends (`pip install -r requirements.txt`; all driven
+  in-process, and compiled into the standalone binary — see below):
   - `dissect.squashfs` — **SquashFS** via the built-in perm-preserving reader
     (the common case for these devices)
-  - `7z` on `PATH` — cramfs / ext / gzip and nested archives, plus SquashFS
-    fallback (e.g. `scoop install 7zip`, or 7-Zip on Windows)
-  - `jefferson` — JFFS2 images
-  - `ubi_reader` — UBI / UBIFS images
+  - `jefferson` — **JFFS2** images
+  - `ubi_reader` — **UBI / UBIFS** images
+- `7z` on `PATH` — cramfs / ext / gzip and nested archives, plus a SquashFS
+  fallback (e.g. `scoop install 7zip`, or 7-Zip on Windows). The only backend
+  that isn't Python.
 
 The analysis core is pure stdlib; the backends above are only used to unpack the
 image. The CVE-corpus feature downloads a zip on demand.
@@ -75,12 +79,16 @@ until a Linux rootfs appears:
   Falls back to a carved `[offset:EOF]` slice handed to **7z** if the reader
   can't parse it (or isn't installed)
 - **cramfs / ext / gzip** -> carved slice handed to **7z**
-- **JFFS2** -> **jefferson** (carved slice)
-- **UBI / UBIFS** -> **ubireader_extract_files** (auto-detects wrapped UBI
-  geometry, falls back to trying common LEB sizes for a bare UBIFS)
+- **JFFS2** -> **jefferson** (carved slice), called in-process
+- **UBI / UBIFS** -> **ubi_reader** (auto-detects wrapped UBI geometry, falls
+  back to trying common LEB sizes for a bare UBIFS), called in-process
 
-Nested archives found after the first pass are recursed into with 7z. If an image
-needs a backend that isn't installed, fwre reports which one to install.
+jefferson and ubi_reader are invoked through their Python entry points rather
+than as external commands, so they work identically from a `pip install` and
+from the standalone binary; if the module isn't importable, fwre falls back to
+the PATH executable of the same name. Nested archives found after the first pass
+are recursed into with 7z. If an image needs a backend that isn't available,
+fwre reports which one to install.
 
 ## Build a standalone binary
 
@@ -89,10 +97,13 @@ build_nuitka.bat     # Windows -> dist\fwre.exe
 ./build_nuitka.sh    # Linux   -> dist/fwre
 ```
 
-Both compile the pure-Python `fwre` package with Nuitka into one self-contained
-executable. The subprocess backends (7z, jefferson, ubi_reader) are **not**
-bundled — keep them on PATH on the target machine. The built-in SquashFS reader
-needs `dissect.squashfs` importable at build time to be compiled in.
+Both compile `fwre` with Nuitka into one self-contained executable, with the
+Python extraction backends (`dissect.squashfs`, `jefferson`, `ubi_reader`)
+compiled in — so the binary unpacks SquashFS/JFFS2/UBI with **nothing else
+installed**. (fwre imports them lazily, so the build names each one explicitly to
+Nuitka; installing `requirements.txt` before building is what makes them
+available to bundle.) Only **7z** remains an external system tool, used for
+cramfs/ext/gzip and nested archives — keep it on PATH if you need those.
 
 CI does the same on every push: `.github/workflows/build.yml` builds both
 platforms (independently — one failing leg still ships the other), uploads each

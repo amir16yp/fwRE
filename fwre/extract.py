@@ -5,14 +5,21 @@ The raw .bin flash dumps carry a bootloader, one or more uImage kernels and a
 root filesystem. 7z locates and unpacks SquashFS/cramfs/ext/gzip regardless of
 offset; when it grabs the wrong (earlier) archive we locate filesystem magics
 and hand 7z a carved [offset:EOF] slice per candidate. For JFFS2 and UBI/UBIFS
-- which 7z cannot unpack - we shell out to `jefferson` and
-`ubireader_extract_files` respectively (optional; install via requirements.txt).
+- which 7z cannot unpack - we drive `jefferson` and `ubi_reader`, which are pure
+Python packages: we call their `main()` in-process (so they are compiled into
+the standalone Nuitka binary and need no separate install), falling back to the
+PATH executable when the module isn't importable.
 """
 from __future__ import annotations
 
+import contextlib
+import importlib
+import importlib.util
+import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 
@@ -90,6 +97,22 @@ def find_ubireader() -> str | None:
     return shutil.which("ubireader_extract_files")
 
 
+def _module_available(mod: str) -> bool:
+    try:
+        return importlib.util.find_spec(mod) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _have_jefferson() -> bool:
+    """jefferson usable either as a bundled/importable module or a PATH tool."""
+    return _module_available("jefferson") or find_jefferson() is not None
+
+
+def _have_ubireader() -> bool:
+    return _module_available("ubireader") or find_ubireader() is not None
+
+
 def _run_cmd(cmd: list[str]) -> tuple[bool, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -99,16 +122,54 @@ def _run_cmd(cmd: list[str]) -> tuple[bool, str]:
     return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
 
 
+def _run_pymodule(target: str, argv: list[str]) -> "tuple[bool, str] | None":
+    """Invoke a console-script `main()` in-process, e.g. "jefferson.cli:main".
+
+    These extractors are pure-Python packages, so calling their entry point
+    directly means they work inside the standalone binary (where there is no
+    `jefferson`/`ubireader_extract_files` on PATH). Returns (ok, log), or None
+    if the module isn't importable so the caller can fall back to a PATH tool.
+    """
+    mod_name, _, func_name = target.partition(":")
+    try:
+        mod = importlib.import_module(mod_name)
+    except Exception:
+        return None
+    func = getattr(mod, func_name, None)
+    if func is None:
+        return None
+    buf = io.StringIO()
+    saved_argv = sys.argv
+    sys.argv = [mod_name.split(".")[0], *argv]
+    code = 0
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            try:
+                func()
+            except SystemExit as e:          # both tools sys.exit() on completion
+                code = e.code if isinstance(e.code, int) else (0 if not e.code else 1)
+            except Exception as e:            # a parse failure must not crash us
+                buf.write(f"\n[in-proc {mod_name}] {e}\n")
+                code = 1
+    finally:
+        sys.argv = saved_argv
+    return code == 0, buf.getvalue()
+
+
 def _extract_jffs2(image: str, offset: int, sub: str) -> tuple[bool, str]:
     """Carve [offset:EOF] and run jefferson on it (no offset flag in jefferson)."""
-    tool = find_jefferson()
-    if not tool:
-        return False, "jefferson not installed"
     with tempfile.NamedTemporaryFile(suffix=".jffs2", delete=False) as tf:
         tmp = tf.name
     try:
         _carve_slice(image, offset, tmp)
-        return _run_cmd([tool, tmp, "-d", sub, "-f"])
+        argv = [tmp, "-d", sub, "-f"]
+        r = _run_pymodule("jefferson.cli:main", argv)   # bundled / importable
+        if r is not None:
+            return r
+        tool = find_jefferson()                          # PATH fallback
+        if not tool:
+            return False, "jefferson not installed"
+        return _run_cmd([tool, *argv])
     finally:
         try:
             os.unlink(tmp)
@@ -125,20 +186,22 @@ def _extract_ubi(image: str, offset: int, sub: str) -> tuple[bool, str]:
     """Drive ubi_reader. For a wrapped UBI image it auto-detects geometry; for a
     bare UBIFS it needs the LEB size, so we try the common ones. Bounded and
     fails fast (ubi_reader rejects wrong geometry immediately)."""
-    tool = find_ubireader()
-    if not tool:
+    if not _have_ubireader():
         return False, "ubi_reader not installed"
+    tool = find_ubireader()  # None when only the importable module is present
     attempts = [
-        [tool, image, "-o", sub],                      # wrapped UBI, auto
-        [tool, image, "-o", sub, "-g", "0"],           # guess UBI offset
+        [image, "-o", sub],                            # wrapped UBI, auto
+        [image, "-o", sub, "-g", "0"],                 # guess UBI offset
     ]
     for leb in _COMMON_LEB:                             # bare UBIFS geometries
-        attempts.append([tool, image, "-o", sub, "-s", str(offset),
-                         "-e", str(leb)])
+        attempts.append([image, "-o", sub, "-s", str(offset), "-e", str(leb)])
     log = ""
-    for cmd in attempts:
-        ok, out = _run_cmd(cmd)
-        log += f"\n$ {' '.join(cmd[3:])}\n{out[-200:]}"
+    for argv in attempts:
+        r = _run_pymodule("ubireader.scripts.ubireader_extract_files:main", argv)
+        if r is None:                                  # module gone -> PATH tool
+            r = _run_cmd([tool, *argv]) if tool else (False, "ubi_reader missing")
+        _ok, out = r
+        log += f"\n$ ubireader_extract_files {' '.join(argv)}\n{out[-200:]}"
         if _find_rootfs(sub) is not None:
             return True, log
     return False, log
@@ -348,9 +411,9 @@ def extract(image: str, out_dir: str, *, recurse: bool = True,
     # install it; otherwise the FS types just didn't yield a Linux rootfs.
     if res.rootfs is None and res.detected_fs:
         missing = []
-        if any(k in _JFFS2_KINDS for k in res.detected_fs) and not find_jefferson():
+        if any(k in _JFFS2_KINDS for k in res.detected_fs) and not _have_jefferson():
             missing.append(_FS_TOOL_HINT["jffs2"])
-        if any(k in _UBI_KINDS for k in res.detected_fs) and not find_ubireader():
+        if any(k in _UBI_KINDS for k in res.detected_fs) and not _have_ubireader():
             missing.append(_FS_TOOL_HINT["ubi"])
         if missing:
             res.hint = "; ".join(missing)

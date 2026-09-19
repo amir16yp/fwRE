@@ -76,8 +76,9 @@ jobs:
         continue-on-error: true   # Nuitka can usually manage without these
         run: sudo apt-get update && sudo apt-get install -y patchelf ccache
 
-      - name: Install optional extractors (bundled into the binary when present)
-        continue-on-error: true   # a broken optional wheel must not fail the build
+      - name: Install extraction backends (compiled into the binary)
+        # dissect.squashfs / jefferson / ubi_reader are bundled by the build, so
+        # this must succeed; a failure fails only this platform leg, not the other
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
       - name: Build with Nuitka
