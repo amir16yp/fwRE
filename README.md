@@ -86,6 +86,12 @@ Both compile the pure-Python `fwre` package with Nuitka into one self-contained
 executable. The external tools (7z, jefferson, ubi_reader) are invoked via
 subprocess and are **not** bundled — keep them on PATH on the target machine.
 
+CI does the same on every push: `.github/workflows/build.yml` builds both
+platforms (independently — one failing leg still ships the other), uploads each
+binary as a workflow artifact, and on a `v*` tag attaches them to the matching
+GitHub release (`fwre-linux-x86_64`, `fwre-windows-x86_64.exe`). A manual run
+(`workflow_dispatch`) can target an existing tag.
+
 ## Analyzers
 
 | module | what it finds |
@@ -99,7 +105,8 @@ subprocess and are **not** bundled — keep them on PATH on the target machine.
 | `analyze.py` (attack surface) | init scripts (`inittab`, `init.d/rcS`), started daemons, direct-shell telnetd, gdbserver/debug shells |
 | `cvedb.py` | component fingerprinting (busybox, dropbear, openssl, kernel, U-Boot, mbedTLS, sqlite, expat, curl, …) + curated high-impact CVE rules (always available, offline) |
 | `cvestore.py` | full **cvelistV5 corpus** — download once, SQLite index, version-range matching |
-| `analyze.py` (network IOCs) | URLs, IPs, MACs, cloud/MQTT/OTA endpoints — **cleartext-OTA (HIGH)** and **P2P/cloud control** endpoints classified distinctly (phone-home infra) |
+| `analyze.py` (network IOCs) | URLs, IPs, MACs, cloud/MQTT/OTA endpoints — **cleartext-OTA (HIGH)** and **P2P/cloud control** endpoints classified distinctly (phone-home infra). Every hit carries **where it was found**: `file:line` in text, `file@0xvaddr (file+0xoffset)` in binaries |
+| `netcalls.py` | **network API usage per binary** — BSD socket / resolver / TLS / curl / MQTT calls resolved to the **GOT slot address** they are called through (`.got`/`.got.plt`, incl. the MIPS GOT layout), so you can jump straight to the call site. Only *imported* (SHN_UNDEF) symbols count, so libc's own exports don't produce noise; flags **listener + `system()`/`exec*()`** combinations and refines `network_facing` for the checksec table |
 | `analyze.py` (secrets, cont.) | now also scans **inside ELFs/`.so`** via string extraction (keys compiled into cloud/app daemons), adds AWS-secret/Alibaba/Slack/Telegram/Tuya patterns + an **entropy gate** |
 | `analyze.py` (binaries, cont.) | **static-binary** dangerous-func detection (string scan), **RWX segment** + **UPX/packed** flags, `.comment`/toolchain, global hardening rollup |
 | `bootlog.py` | parses serial **`*.bootlog.txt`**: U-Boot/kernel/gcc versions, `mtdparts`, `bootargs` (init=/console=/root=), boot-time creds → feeds CVE matching |
@@ -146,6 +153,12 @@ present, corpus matches are added on top of the curated rules. To refresh, run
   for a key embedded in a binary) + a recovered-credentials table. A `fwRE`
   banner prints at startup. Disable with `--nocolors` / `--nologo` (or
   `NO_COLOR=1`); colour is auto-off when stdout isn't a terminal.
+- Every URL/IOC and every network API call is reported **with its exact site**:
+  `etc/init.d/rcS:42` for text, `usr/bin/ipc@0x8a55ec (file+0x4a55ec)` for a
+  string inside a binary, `usr/bin/ipc@0xa4d098 (GOT)` for a call. The compact
+  console list shows the first site; `-v`/`--details` prints the full evidence
+  line (all sites) under each finding, and the `-o` report / `--json` output
+  always carries them all.
 
 ### Interactive post-analysis phases
 
@@ -182,6 +195,7 @@ fwre/
   term.py        colour output + figlet banner (--nocolors / --nologo)
   elf.py         pure-python ELF parser + checksec (+ .comment, RWX, packed, static dangerous-func scan)
   interesting.py ranks the unusual / vendor / outlier binaries worth manual RE
+  netcalls.py    socket/TLS/HTTP API usage per binary, with GOT addresses
   analyze.py     rootfs orchestrator + credential/secret/binary/attack-surface/IOC analyzers
   services.py    per-service misconfig + web-app sink analyzers (+ TR-069/UPnP/VPN/RTSP/compiled-CGI)
   defaults.py    default/weak credential recovery (+ sudoers / cred-backup files)
@@ -197,9 +211,9 @@ fwre/
   correlate.py   cross-image (fleet) correlation for batch
   sbom.py        CycloneDX SBOM export
   cache.py       cache-dir helper
-  finding.py     Finding / Severity model
+  finding.py     Finding / Severity model + Site (file:line / address of evidence)
   report.py      markdown + json renderers
-  strings_util.py in-process strings(1)
+  strings_util.py in-process strings(1) (+ offset-aware extraction)
 ```
 
 ## Notes & caveats

@@ -1,0 +1,163 @@
+name: build
+
+# Compiles fwre with Nuitka for Linux and Windows, uploads each binary as a
+# workflow artifact, and (on a tag, or a manual run given a tag) attaches them
+# to the matching GitHub release.
+#
+# Failure isolation: the two platform builds are independent (fail-fast is off,
+# so one leg dying neither cancels nor blocks the other) and the release job
+# runs with `always()`, publishing whatever artifacts did get built. A broken
+# Windows build therefore still ships the Linux binary, and vice versa - the
+# run is still reported red so the breakage is visible.
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to attach the binaries to (blank = don't release)"
+        required: false
+        default: ""
+
+concurrency:
+  group: build-${{ github.ref }}
+  # never cancel a tag/release run half-way through
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            build: bash build_nuitka.sh
+            shell: bash
+            built: dist/fwre
+            asset: fwre-linux-x86_64
+          - name: windows-x86_64
+            os: windows-latest
+            build: build_nuitka.bat
+            shell: cmd
+            built: dist/fwre.exe
+            asset: fwre-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 is the newest interpreter Nuitka supports well across both
+          # runners; bump only after checking Nuitka's support matrix
+          python-version: "3.12"
+
+      - name: Cache Nuitka build cache
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cache/Nuitka
+            ~/AppData/Local/Nuitka/Nuitka/Cache
+          key: nuitka-${{ matrix.name }}-${{ hashFiles('fwre/**/*.py', 'fwre_main.py') }}
+          restore-keys: nuitka-${{ matrix.name }}-
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        continue-on-error: true   # Nuitka can usually manage without these
+        run: sudo apt-get update && sudo apt-get install -y patchelf ccache
+
+      - name: Install optional extractors (bundled into the binary when present)
+        continue-on-error: true   # a broken optional wheel must not fail the build
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Build with Nuitka
+        shell: ${{ matrix.shell }}
+        run: ${{ matrix.build }}
+
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${{ matrix.built }}"
+          "./${{ matrix.built }}" --nologo --help > /dev/null
+          "./${{ matrix.built }}" --nologo analyze --help > /dev/null
+          echo "[+] $(ls -lh '${{ matrix.built }}' | awk '{print $5}') binary works"
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp "${{ matrix.built }}" "out/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        # upload whatever exists even if a later step failed
+        if: always()
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: warn
+          retention-days: 30
+
+  release:
+    name: attach to release
+    needs: build
+    # always(): run even when one (or both) build legs failed, so a partial
+    # build set still reaches the release
+    if: ${{ always() && (startsWith(github.ref, 'refs/tags/')
+        || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        continue-on-error: true   # no artifacts at all is handled below
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect what was actually built
+        id: collect
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(artifacts/*)
+          printf '%s\n' "${files[@]:-<none>}"
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::no binaries were produced - nothing to release"
+            echo "have=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ ${#files[@]} -lt 2 ]; then
+            echo "::warning::only ${#files[@]} of 2 platform builds produced a binary"
+          fi
+
+      - name: Upload to the release
+        if: steps.collect.outputs.have == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          chmod +x artifacts/* || true
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "[*] creating release $TAG"
+            gh release create "$TAG" --title "$TAG" --generate-notes \
+              || gh release create "$TAG" --title "$TAG" --notes "Automated Nuitka build"
+          fi
+          gh release upload "$TAG" artifacts/* --clobber
+          echo "[+] uploaded: $(ls artifacts | tr '\n' ' ')"
